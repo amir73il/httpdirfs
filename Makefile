@@ -1,7 +1,7 @@
 VERSION = 1.2.3
 
-CFLAGS += -g -O2  -Wall -Wextra -Wshadow \
-	-fsanitize=undefined -fanalyzer -Wno-analyzer-file-leak \
+CFLAGS += -g -O2  -Wall -Wextra -Wshadow -Wno-unused-result \
+	-fsanitize=undefined \
 	-rdynamic -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -DVERSION=\"$(VERSION)\"\
 	`pkg-config --cflags-only-I gumbo libcurl fuse uuid expat`
 LDFLAGS += `pkg-config --libs-only-L gumbo libcurl fuse uuid expat`
