@@ -82,6 +82,23 @@ extern int CACHE_SYSTEM_INIT;
 extern char *META_DIR;
 
 /**
+ * \brief The data directory
+ */
+extern char *DATA_DIR;
+
+/**
+ * \brief convert relative data path to absolute path
+ * \return string to be freed by caller
+ */
+char *Data_abspath(const char *relpath);
+
+/**
+ * \brief convert absolute data path to relative path
+ * \return pointer into input string or NULL
+ */
+const char *Data_relpath(const char *abspath);
+
+/**
  * \brief initialise the cache system directories
  * \details This function basically sets up the following variables:
  *  - META_DIR

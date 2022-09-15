@@ -36,6 +36,8 @@ void PTHREAD_MUTEX_UNLOCK(pthread_mutex_t *x);
  * \brief wrapper for exit(EXIT_FAILURE), with error handling
  */
 void exit_failure(void);
+void exit_perror(const char *msg);
+void exit_error(const char *msg);
 
 /**
  * \brief erase a string from the terminal

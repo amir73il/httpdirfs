@@ -2,6 +2,7 @@
 
 #include "link.h"
 #include "log.h"
+#include "util.h"
 
 /*
  * must be included before including <fuse.h>
@@ -12,6 +13,7 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/fanotify.h>
 
 static void *fs_init(struct fuse_conn_info *conn)
 {

@@ -108,10 +108,11 @@ activate Sonic mode.\n");
         }
     }
 
-fuse_start:
-    fuse_local_init(fuse_argc, fuse_argv);
+    if (CONFIG.fanotify_enabled)
+        return fanotify_main();
 
-    return 0;
+fuse_start:
+    return fuse_local_init(fuse_argc, fuse_argv);
 }
 
 void parse_config_file(char ***argv, int *argc)
@@ -199,6 +200,7 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
         { "insecure-tls", no_argument, NULL, 'L' },     /* 20 */
         { "config", required_argument, NULL, 'L' },     /* 21 */
         { "single-file-mode", required_argument, NULL, 'L' },   /* 22 */
+        { "fanotify", no_argument, NULL, 'L' },    /* 23 */
         { 0, 0, 0, 0 }
     };
     while ((c =
@@ -268,6 +270,7 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
                 CONFIG.http_wait_sec = atoi(optarg);
                 break;
             case 14:
+                CONFIG.cache_enabled = 1;
                 CONFIG.cache_dir = strdup(optarg);
                 break;
             case 15:
@@ -295,6 +298,10 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
                 break;
             case 22:
                 CONFIG.mode = SINGLE;
+                break;
+            case 23:
+                CONFIG.fanotify_enabled = 1;
+                CONFIG.cache_enabled = 1;
                 break;
             default:
                 fprintf(stderr, "see httpdirfs -h for usage\n");
@@ -370,6 +377,8 @@ HTTPDirFS options:\n\
         --single-file-mode  Single file mode - rather than mounting a whole\n\
                             directory, present a single file inside a virtual\n\
                             directory.\n\
+        --fanotify          fanotify mode - rather than mounting FUSE, populate\n\
+                            files on access to cache data dir (implies --cache).\n\
 \n\
     For mounting a Airsonic / Subsonic server:\n\
         --sonic-username    The username for your Airsonic / Subsonic server\n\

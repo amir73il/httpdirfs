@@ -32,7 +32,32 @@ static pthread_mutex_t cf_lock;
 /**
  * \brief The data directory
  */
-static char *DATA_DIR;
+char *DATA_DIR;
+static size_t DATA_DIR_len;
+
+/**
+ * \brief convert relative data path to absolute path
+ * \return string to be freed by caller
+ */
+char *Data_abspath(const char *relpath)
+{
+    return path_append(DATA_DIR, relpath);
+}
+
+/**
+ * \brief convert absolute data path to relative path
+ * \return pointer into input string or NULL
+ */
+const char *Data_relpath(const char *abspath)
+{
+    if (strlen(abspath) < DATA_DIR_len ||
+        strncmp(abspath, DATA_DIR, DATA_DIR_len)) {
+	    printf("'%s' '%s' %ld\n", abspath, DATA_DIR, DATA_DIR_len);
+        return NULL;
+    }
+
+    return abspath + DATA_DIR_len;
+}
 
 /**
  * \brief Calculate cache system directory path
@@ -103,6 +128,8 @@ void CacheSystem_init(const char *path, int url_supplied)
 
     META_DIR = path_append(path, "meta/");
     DATA_DIR = path_append(path, "data/");
+    DATA_DIR_len = strlen(DATA_DIR) - 1;
+
     /*
      * Check if directories exist, if not, create them
      */
@@ -328,6 +355,10 @@ static long Data_size(const char *fn)
  */
 static long Data_read(Cache *cf, uint8_t *buf, off_t len, off_t offset)
 {
+    /* >/dev/null */
+    if (!buf)
+        return len;
+
     if (len == 0) {
         lprintf(error, "requested to read 0 byte!\n");
         return -EINVAL;

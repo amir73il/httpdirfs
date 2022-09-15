@@ -54,6 +54,8 @@ void Config_init(void)
     CONFIG.insecure_tls = 0;
 
     /*--------------- Cache related ---------------*/
+    CONFIG.fanotify_enabled = 0;
+
     CONFIG.cache_enabled = 0;
 
     CONFIG.cache_dir = NULL;

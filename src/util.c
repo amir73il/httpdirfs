@@ -74,6 +74,18 @@ void PTHREAD_MUTEX_LOCK(pthread_mutex_t *x)
     }
 }
 
+void exit_error(const char *msg)
+{
+    fprintf(stderr, "ERROR: %s\n", msg);
+    exit(EXIT_FAILURE);
+}
+
+void exit_perror(const char *msg)
+{
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
 void exit_failure(void)
 {
     int nptrs;

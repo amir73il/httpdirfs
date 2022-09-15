@@ -9,4 +9,7 @@
 /* Initialise fuse */
 int fuse_local_init(int argc, char **argv);
 
+/* Initialise fanotify and run event loop */
+int fanotify_main();
+
 #endif
