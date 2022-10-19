@@ -982,17 +982,28 @@ void Cache_close(Cache *cf)
         return;
     }
 
+    /*
+     * Wait for any other download thread to finish
+     */
+    lprintf(cache_lock_debug,
+            "thread %ld: locking w_lock;\n", pthread_self());
+    PTHREAD_MUTEX_LOCK(&cf->w_lock);
+
     if (Meta_write(cf)) {
         lprintf(error, "Meta_write() error.");
     }
 
-    if (fclose(cf->mfp)) {
-        lprintf(error, "cannot close metadata: %s.\n", strerror(errno));
+    if (fflush(cf->mfp) || fsync(fileno(cf->dfp)) || fclose(cf->mfp)) {
+        lprintf(error, "cannot flush-on-close metadata: %s.\n", strerror(errno));
     }
 
-    if (fclose(cf->dfp)) {
-        lprintf(error, "cannot close data file %s.\n", strerror(errno));
+    if (fflush(cf->dfp) || fsync(fileno(cf->dfp)) || fclose(cf->dfp)) {
+        lprintf(error, "cannot flush-on-close data file %s.\n", strerror(errno));
     }
+
+    lprintf(cache_lock_debug,
+            "thread %x: unlocking w_lock;\n", pthread_self());
+    PTHREAD_MUTEX_UNLOCK(&cf->w_lock);
 
     cf->link->cache_ptr = NULL;
 
