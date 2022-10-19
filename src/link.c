@@ -701,6 +701,9 @@ LinkTable *LinkTable_disk_open(const char *dirn)
 LinkTable *path_to_Link_LinkTable_new(const char *path)
 {
     Link *link = path_to_Link(path);
+    if (!link)
+        return NULL;
+
     LinkTable *next_table = link->next_table;
     if (!next_table) {
         if (CONFIG.mode == NORMAL) {
@@ -804,6 +807,9 @@ static Link *path_to_Link_recursive(char *path, LinkTable *linktbl)
 
 Link *path_to_Link(const char *path)
 {
+    if (!ROOT_LINK_TBL)
+        return NULL;
+
     lprintf(link_lock_debug,
             "thread %x: locking link_lock;\n", pthread_self());
 

@@ -579,7 +579,8 @@ void Cache_delete(const char *fn)
 {
     if (CONFIG.mode == SONIC) {
         Link *link = path_to_Link(fn);
-        fn = link->sonic.id;
+        if (link)
+            fn = link->sonic.id;
     }
 
     char *metafn = path_append(META_DIR, fn);
@@ -668,6 +669,11 @@ static void Meta_create(Cache *cf)
 int Cache_create(const char *path)
 {
     Link *this_link = path_to_Link(path);
+
+    if (!this_link) {
+        lprintf(error, "cannot find link for %s.\n", path);
+        return -ENOENT;
+    }
 
     char *fn = "__UNINITIALISED__";
     if (CONFIG.mode == NORMAL) {
