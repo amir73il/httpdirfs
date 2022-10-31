@@ -66,6 +66,8 @@ typedef struct {
     /*--------------- Cache related ---------------*/
     /** \brief Whether fanotify mode is enabled */
     int fanotify_enabled;
+    /** \brief The mount point*/
+    char *mount_dir;
     /** \brief Whether cache mode is enabled */
     int cache_enabled;
     /** \brief The cache location*/
