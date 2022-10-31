@@ -362,23 +362,35 @@ static int Meta_write(Cache *cf)
  * \brief create a data file
  * \details We use sparse creation here
  * \return exit on failure
+ *  -   0, if the cache file already exists
+ *  -   1, if file was created successfully
  */
-static void Data_create(Cache *cf)
+static int Data_create(Cache *cf, int reset)
 {
-    int fd;
-    int mode;
+    int fd, ret = -1;
+    int mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 
-    mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-    fd = openat(DATA_DIR_fd, cf->path, O_WRONLY | O_CREAT, mode);
+    fd = openat(DATA_DIR_fd, cf->path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (fd > 0) {
+        ret = 1;
+    } else if (errno == EEXIST) {
+        fd = openat(DATA_DIR_fd, cf->path, O_WRONLY, mode);
+        if (fd > 0)
+            ret = 0;
+    }
     if (fd == -1) {
         lprintf(fatal, "open(): %s\n", strerror(errno));
     }
     if (ftruncate(fd, cf->content_length)) {
         lprintf(warning, "ftruncate(): %s\n", strerror(errno));
     }
+    if (reset && fallocate(fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, 0, cf->content_length)) {
+        lprintf(warning, "fallocate(): %s\n", strerror(errno));
+    }
     if (close(fd)) {
         lprintf(fatal, "close:(): %s\n", strerror(errno));
     }
+    return ret;
 }
 
 /**
@@ -531,24 +543,30 @@ end:
 int CacheDir_create(const char *dirn)
 {
     char *metadirn = path_append(META_DIR, dirn);
-    int i;
+    int i, ret = 0;
 
     /* relative path empty? */
     if (!*dirn)
         return 0;
 
-    i = -mkdir(metadirn, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-    if (i && (errno != EEXIST)) {
+    i = mkdir(metadirn, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+    if (!i) {
+        ret = 1;
+    } else if (errno != EEXIST) {
         lprintf(fatal, "mkdir(): %s\n", strerror(errno));
+        return i;
     }
 
-    i |= -mkdirat(DATA_DIR_fd, dirn,
-                S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) << 1;
-    if (i && (errno != EEXIST)) {
+    i = mkdirat(DATA_DIR_fd, dirn,
+                S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+    if (!i) {
+        ret |= 2;
+    } else if (errno != EEXIST) {
         lprintf(fatal, "mkdirat(%d, %s): %s\n", DATA_DIR_fd, dirn, strerror(errno));
+        return i;
     }
     FREE(metadirn);
-    return -i;
+    return ret;
 }
 
 /**
@@ -628,7 +646,7 @@ static void Cache_free(Cache *cf)
  *  -   0, if both metadata and cache file exist
  *  -   -1, otherwise
  */
-static int Cache_exist(const char *fn)
+static int Cache_exist(const char *fn, int reset)
 {
     char *metafn = path_append(META_DIR, fn);
     /*
@@ -638,13 +656,13 @@ static int Cache_exist(const char *fn)
     int no_data = faccessat(DATA_DIR_fd, fn, F_OK, AT_SYMLINK_NOFOLLOW);
 
     if (no_meta ^ no_data) {
-        if (no_meta) {
+        if (no_meta && reset) {
             lprintf(warning, "Cache file metadata is missing.\n");
             if (unlinkat(DATA_DIR_fd, fn, 0)) {
                 lprintf(error, "unlink(): %s\n", strerror(errno));
             }
         }
-        if (no_data) {
+        if (no_data && reset) {
             lprintf(warning, "Cache file data is missing.\n");
             if (unlink(metafn)) {
                 lprintf(error, "unlink(): %s\n", strerror(errno));
@@ -660,7 +678,7 @@ static int Cache_exist(const char *fn)
 /**
  * \brief delete a cache file set
  */
-void Cache_delete(const char *fn)
+void Cache_delete(const char *fn, int data_fd)
 {
     if (CONFIG.mode == SONIC) {
         Link *link = path_to_Link(fn);
@@ -675,10 +693,14 @@ void Cache_delete(const char *fn)
         }
     }
 
-    if (!faccessat(DATA_DIR_fd, fn, F_OK, AT_SYMLINK_NOFOLLOW)) {
+    off_t len = Data_size(fn);
+    if (!data_fd && len >= 0) {
         if (unlinkat(DATA_DIR_fd, fn, 0)) {
             lprintf(error, "unlink(): %s\n", strerror(errno));
         }
+    } else if (data_fd && len > 0) {
+        if (fallocate(data_fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, 0, len))
+            lprintf(warning, "fallocate(): %s\n", strerror(errno));
     }
     FREE(metafn);
 }
@@ -732,11 +754,31 @@ static int Meta_open(Cache *cf)
 /**
  * \brief Create a metafile
  * \return exit on error
+ *  -   0, if the cache file already exists
+ *  -   1, if file was created successfully
  */
-static void Meta_create(Cache *cf)
+static int Meta_create(Cache *cf, int reset)
 {
     char *metafn = path_append(META_DIR, cf->path);
-    cf->mfp = fopen(metafn, "w");
+    int fd, ret = -1;
+    int mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+
+    if (reset && !access(metafn, F_OK)) {
+        if (unlink(metafn)) {
+            lprintf(error, "unlink(): %s\n", strerror(errno));
+        }
+    }
+
+    fd = open(metafn, O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (fd > 0) {
+        ret = 1;
+    } else if (errno == EEXIST) {
+        fd = open(metafn, O_WRONLY | O_TRUNC, mode);
+        if (fd > 0)
+            ret = 0;
+    }
+    if (fd > 0)
+        cf->mfp = fdopen(fd, "w");
     if (!cf->mfp) {
         /*
          * Failed to open the data file
@@ -749,9 +791,10 @@ static void Meta_create(Cache *cf)
                 strerror(errno));
     }
     FREE(metafn);
+    return ret;
 }
 
-int Cache_create(const char *path)
+int Cache_create(const char *path, int reset)
 {
     Link *this_link = path_to_Link(path);
 
@@ -778,7 +821,8 @@ int Cache_create(const char *path)
     /* Skip / prefix to make it a relative path */
     while (*fn == '/')
 	    fn++;
-    lprintf(debug, "Creating cache files for %s.\n", fn);
+    lprintf(debug, "%sing cache files for %s.\n",
+            reset ? "Reset" : "Create", fn);
 
     Cache *cf = Cache_alloc();
     cf->path = strndup(fn, MAX_PATH_LEN);
@@ -788,7 +832,7 @@ int Cache_create(const char *path)
     cf->segbc = (cf->content_length / cf->blksz) + 1;
     cf->seg = CALLOC(cf->segbc, sizeof(Seg));
 
-    Meta_create(cf);
+    reset |= Meta_create(cf, reset);
 
     if (Meta_open(cf)) {
         Cache_free(cf);
@@ -805,16 +849,16 @@ int Cache_create(const char *path)
                 strerror(errno));
     }
 
-    Data_create(cf);
+    reset |= Data_create(cf, reset);
 
     Cache_free(cf);
 
-    int res = Cache_exist(fn);
+    int err = Cache_exist(fn, 1);
 
     if (ptr)
         curl_free(ptr);
 
-    return res;
+    return err ?: reset;
 }
 
 Cache *Cache_open(const char *fn, int data_fd)
@@ -847,7 +891,7 @@ Cache *Cache_open(const char *fn, int data_fd)
      * Check if both metadata and data file exist
      */
     if (CONFIG.mode == NORMAL || CONFIG.mode == SINGLE) {
-        if (Cache_exist(fn)) {
+        if (Cache_exist(fn, !data_fd)) {
 
             lprintf(cache_lock_debug,
                     "thread %x: unlocking cf_lock;\n", pthread_self());
@@ -855,7 +899,7 @@ Cache *Cache_open(const char *fn, int data_fd)
             return NULL;
         }
     } else if (CONFIG.mode == SONIC) {
-        if (Cache_exist(link->sonic.id)) {
+        if (Cache_exist(link->sonic.id, 1)) {
 
             lprintf(cache_lock_debug,
                     "thread %x: unlocking cf_lock;\n", pthread_self());

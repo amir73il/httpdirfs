@@ -107,8 +107,8 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
              * The link clearly exists, the cache cannot be opened, attempt
              * cache creation
              */
-            Cache_delete(path);
-            Cache_create(path);
+            Cache_delete(path, 0);
+            Cache_create(path, 0);
             fi->fh = (uint64_t) Cache_open(path, 0);
             /*
              * The cache definitely cannot be opened for some reason.
