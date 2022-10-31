@@ -13,7 +13,8 @@
 #define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
 #endif
 
-#define FAN_EVENTS (FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
+#define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
+#define FAN_EVENTS	(FAN_PRE_ACCESS)
 
 static void fanotify_add_data_watch(int fanotify_fd, const char *path)
 {
@@ -101,13 +102,50 @@ static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
 	return recv;
 }
 
+/*
+ * Return values:
+ * <0 to deny access
+ * >0 allow access but keep watching
+ *  0 allow access and stop watching
+ */
+static int handle_access_event(int fanotify_fd,
+			       const struct fanotify_event_metadata *event,
+			       const char *relpath, struct stat *st)
+{
+	off_t offset;
+	int ret;
+
+	switch (st->st_mode & S_IFMT) {
+		case S_IFDIR:
+			/* Allow dir to be accessed if all cache entries are created */
+			/* TODO: populate a single child entry on FAN_LOOKUP_PERM event */
+			ret = fs_readdir(fanotify_fd, relpath);
+			break;
+		case S_IFREG:
+			/* Allow file to be accessed if all the file data is downloaded
+			 * or if any block was downloaded, so reading the file sequetially
+			 * to a read buffer smaller than download block size will work.
+			 * TODO: download requested if we can get it from FAN_ACCESS_PERM event */
+			offset = lseek(event->fd, 0, SEEK_HOLE);
+			if (offset < 0)
+				ret = -errno;
+			else if (offset == st->st_size)
+				ret = 0;
+			else
+				ret = fs_read(relpath, event->fd, offset, 1);
+			break;
+		default:
+			ret = -EPERM;
+	}
+
+	return ret;
+}
 
 static void handle_events(int fanotify_fd)
 {
 	const struct fanotify_event_metadata *metadata;
 	struct fanotify_event_metadata buf[200];
 	ssize_t len;
-	off_t offset;
 	char abspath[PATH_MAX];
 	const char *relpath;
 	ssize_t path_len;
@@ -132,11 +170,18 @@ static void handle_events(int fanotify_fd)
 		if (path_len == -1)
 			exit_perror("readlink");
 
-		ret = 0;
 		abspath[path_len] = '\0';
 		relpath = Data_relpath(metadata->fd, abspath);
 		if (!relpath)
 			exit_error("Unexpected path in event");
+
+		/*
+		 * Empty relative path meants event on data root dir -
+		 * use relative path "." for syscalls that do not support
+		 * AT_EMPTY_PATH.
+		 */
+		if (!*relpath)
+			relpath = ".";
 
 		lprintf(debug, "Got event 0x%08x on '%s' (%s)\n",
 			metadata->mask, abspath, relpath);
@@ -145,31 +190,9 @@ static void handle_events(int fanotify_fd)
 		if (fstat(metadata->fd, &st))
 			exit_perror("fstat");
 
-		switch (st.st_mode & S_IFMT) {
-			case S_IFDIR:
-				/* Empty relative path meants event on data root dir -
-				 * use relative path "." for syscalls that do not support AT_EMPTY_PATH */
-				if (!*relpath)
-					relpath = ".";
-				/* Allow dir to be accessed if all cache entries are created */
-				/* TODO: populate a single child entry on FAN_LOOKUP_PERM event */
-				ret = fs_readdir(fanotify_fd, relpath);
-				break;
-			case S_IFREG:
-				/* Allow file to be accessed if all the file data is downloaded
-				 * or if any block was downloaded, so reading the file sequetially
-				 * to a read buffer smaller than download block size will work.
-				 * TODO: download requested if we can get it from FAN_ACCESS_PERM event */
-				offset = lseek(metadata->fd, 0, SEEK_HOLE);
-				if (offset < 0)
-					ret = -errno;
-				else if (offset == st.st_size)
-					ret = 0;
-				else
-					ret = fs_read(relpath, metadata->fd, offset, 1);
-				break;
-			default:
-				ret = -EPERM;
+		ret = -EPERM;
+		if (metadata->mask & FAN_PRE_ACCESS) {
+			ret = handle_access_event(fanotify_fd, metadata, relpath, &st);
 		}
 
 		response.fd = metadata->fd;
