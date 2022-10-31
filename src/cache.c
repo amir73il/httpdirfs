@@ -34,6 +34,7 @@ static pthread_mutex_t cf_lock;
  */
 char *DATA_DIR;
 static size_t DATA_DIR_len;
+int DATA_DIR_fd = AT_FDCWD;
 
 /**
  * \brief convert relative data path to absolute path
@@ -48,12 +49,28 @@ char *Data_abspath(const char *relpath)
  * \brief convert absolute data path to relative path
  * \return pointer into input string or NULL
  */
-const char *Data_relpath(const char *abspath)
+const char *Data_relpath(int dirfd, const char *abspath)
 {
-    if (strlen(abspath) < DATA_DIR_len ||
+    size_t pathlen = strlen(abspath);
+    if (pathlen < DATA_DIR_len ||
         strncmp(abspath, DATA_DIR, DATA_DIR_len)) {
-	    printf("'%s' '%s' %ld\n", abspath, DATA_DIR, DATA_DIR_len);
+        lprintf(warning, "'%s' is not under '%.*s'\n",
+                abspath, (int)DATA_DIR_len, DATA_DIR);
         return NULL;
+    }
+
+    /* Strip the / prefix from relative path */
+    while (abspath[DATA_DIR_len] == '/') {
+        abspath++;
+        pathlen--;
+    }
+
+    /* Store data dir dirfd if relpath is empty */
+    if (DATA_DIR_fd < 0 && dirfd > 0 && pathlen == DATA_DIR_len) {
+        int fd = dup(dirfd);
+        if (fd > 0)
+            DATA_DIR_fd = fd;
+        lprintf(debug, "DATA_DIR_fd = %d\n", DATA_DIR_fd);
     }
 
     return abspath + DATA_DIR_len;
@@ -142,6 +159,10 @@ void CacheSystem_init(const char *path, int url_supplied)
             && (errno != EEXIST)) {
         lprintf(fatal, "mkdir(): %s\n", strerror(errno));
     }
+
+    /* chdir into DATA_DIR so we can use relative paths */
+    if (chdir(DATA_DIR))
+        exit_perror("chdir");
 
     if (CONFIG.mode == SONIC) {
         char *sonic_path;
@@ -312,9 +333,7 @@ static void Data_create(Cache *cf)
     int mode;
 
     mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-    char *datafn = path_append(DATA_DIR, cf->path);
-    fd = open(datafn, O_WRONLY | O_CREAT, mode);
-    FREE(datafn);
+    fd = openat(DATA_DIR_fd, cf->path, O_WRONLY | O_CREAT, mode);
     if (fd == -1) {
         lprintf(fatal, "open(): %s\n", strerror(errno));
     }
@@ -332,10 +351,8 @@ static void Data_create(Cache *cf)
  */
 static long Data_size(const char *fn)
 {
-    char *datafn = path_append(DATA_DIR, fn);
     struct stat st;
-    int s = stat(datafn, &st);
-    FREE(datafn);
+    int s = fstatat(DATA_DIR_fd, fn, &st, AT_SYMLINK_NOFOLLOW);
     if (!s) {
         return st.st_size;
     }
@@ -478,20 +495,22 @@ end:
 int CacheDir_create(const char *dirn)
 {
     char *metadirn = path_append(META_DIR, dirn);
-    char *datadirn = path_append(DATA_DIR, dirn);
     int i;
+
+    /* relative path empty? */
+    if (!*dirn)
+        return 0;
 
     i = -mkdir(metadirn, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
     if (i && (errno != EEXIST)) {
         lprintf(fatal, "mkdir(): %s\n", strerror(errno));
     }
 
-    i |= -mkdir(datadirn,
+    i |= -mkdirat(DATA_DIR_fd, dirn,
                 S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) << 1;
     if (i && (errno != EEXIST)) {
-        lprintf(fatal, "mkdir(): %s\n", strerror(errno));
+        lprintf(fatal, "mkdirat(%d, %s): %s\n", DATA_DIR_fd, dirn, strerror(errno));
     }
-    FREE(datadirn);
     FREE(metadirn);
     return -i;
 }
@@ -576,21 +595,21 @@ static void Cache_free(Cache *cf)
 static int Cache_exist(const char *fn)
 {
     char *metafn = path_append(META_DIR, fn);
-    char *datafn = path_append(DATA_DIR, fn);
     /*
      * access() returns 0 on success
      */
     int no_meta = access(metafn, F_OK);
-    int no_data = access(datafn, F_OK);
+    int no_data = faccessat(DATA_DIR_fd, fn, F_OK, AT_SYMLINK_NOFOLLOW);
 
     if (no_meta ^ no_data) {
         if (no_meta) {
-            lprintf(warning, "Cache file partially missing.\n");
-            if (unlink(datafn)) {
+            lprintf(warning, "Cache file metadata is missing.\n");
+            if (unlinkat(DATA_DIR_fd, fn, 0)) {
                 lprintf(error, "unlink(): %s\n", strerror(errno));
             }
         }
         if (no_data) {
+            lprintf(warning, "Cache file data is missing.\n");
             if (unlink(metafn)) {
                 lprintf(error, "unlink(): %s\n", strerror(errno));
             }
@@ -598,7 +617,6 @@ static int Cache_exist(const char *fn)
     }
 
     FREE(metafn);
-    FREE(datafn);
 
     return no_meta | no_data;
 }
@@ -615,20 +633,18 @@ void Cache_delete(const char *fn)
     }
 
     char *metafn = path_append(META_DIR, fn);
-    char *datafn = path_append(DATA_DIR, fn);
     if (!access(metafn, F_OK)) {
         if (unlink(metafn)) {
             lprintf(error, "unlink(): %s\n", strerror(errno));
         }
     }
 
-    if (!access(datafn, F_OK)) {
-        if (unlink(datafn)) {
+    if (!faccessat(DATA_DIR_fd, fn, F_OK, AT_SYMLINK_NOFOLLOW)) {
+        if (unlinkat(DATA_DIR_fd, fn, 0)) {
             lprintf(error, "unlink(): %s\n", strerror(errno));
         }
     }
     FREE(metafn);
-    FREE(datafn);
 }
 
 /**
@@ -639,17 +655,15 @@ void Cache_delete(const char *fn)
  */
 static int Data_open(Cache *cf)
 {
-    char *datafn = path_append(DATA_DIR, cf->path);
-    cf->dfp = fopen(datafn, "r+");
+    int fd = openat(DATA_DIR_fd, cf->path, O_RDWR);
+    cf->dfp = fd > 0 ? fdopen(fd, "r+") : NULL;
     if (!cf->dfp) {
         /*
          * Failed to open the data file
          */
-        lprintf(error, "fopen(%s): %s\n", datafn, strerror(errno));
-        FREE(datafn);
+        lprintf(error, "fopen(%s): %s\n", cf->path, strerror(errno));
         return -1;
     }
-    FREE(datafn);
     return 0;
 }
 
@@ -707,17 +721,23 @@ int Cache_create(const char *path)
     }
 
     char *fn = "__UNINITIALISED__";
+    char *ptr = NULL;
     if (CONFIG.mode == NORMAL) {
         fn = curl_easy_unescape(NULL,
                                 this_link->f_url + ROOT_LINK_OFFSET, 0,
                                 NULL);
+	ptr = fn;
     } else if (CONFIG.mode == SINGLE) {
         fn = curl_easy_unescape(NULL, this_link->linkname, 0, NULL);
+	ptr = fn;
     } else if (CONFIG.mode == SONIC) {
         fn = this_link->sonic.id;
     } else {
         lprintf(fatal, "Invalid CONFIG.mode\n");
     }
+    /* Skip / prefix to make it a relative path */
+    while (*fn == '/')
+	    fn++;
     lprintf(debug, "Creating cache files for %s.\n", fn);
 
     Cache *cf = Cache_alloc();
@@ -751,9 +771,8 @@ int Cache_create(const char *path)
 
     int res = Cache_exist(fn);
 
-    if (CONFIG.mode == NORMAL) {
-        curl_free(fn);
-    }
+    if (ptr)
+        curl_free(ptr);
 
     return res;
 }

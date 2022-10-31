@@ -9,42 +9,46 @@
 #include <sys/stat.h>
 #include <sys/fanotify.h>
 
-#define FAN_EVENTS FAN_ACCESS_PERM
+#ifndef FAN_LOOKUP_PERM
+#define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
+#endif
 
-static void fanotify_add_watch(int fanotify_fd, const char *fn)
+#define FAN_EVENTS (FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
+
+static void fanotify_add_data_watch(int fanotify_fd, const char *path)
 {
-	char *path = Data_abspath(fn);
-
 	if (fanotify_mark(fanotify_fd, FAN_MARK_ADD, FAN_EVENTS | FAN_ONDIR,
-			  AT_FDCWD, path)) {
-		exit_perror("fanotify_mark");
+			  DATA_DIR_fd, path)) {
+		lprintf(warning, "Failed adding watch on '%s' (%s)\n",
+			path, strerror(errno));
+		return;
 	}
 
-	printf("Added fanotify access watch on path %s\n", path);
-	FREE(path);
+	lprintf(info, "Added watch on '%s'\n", path);
 }
 
-static void fanotify_remove_watch(int fanotify_fd, const char *path)
+static void fanotify_remove_data_watch(int fanotify_fd, const char *path)
 {
 	if (fanotify_mark(fanotify_fd, FAN_MARK_REMOVE, FAN_EVENTS | FAN_ONDIR,
-			  AT_FDCWD, path)) {
-		exit_perror("fanotify_mark");
+			  DATA_DIR_fd, path)) {
+		lprintf(warning, "Failed removing watch on '%s' (%s)\n",
+			path, strerror(errno));
+		return;
 	}
 
-	printf("Removed fanotify access watch on path %s\n", path);
+	lprintf(info, "Removed watch on '%s'\n", path);
 }
 
-static int fs_readdir(int fanotify_fd, const char *abspath)
+static int fs_readdir(int fanotify_fd, const char *path)
 {
-	const char *path = Data_relpath(abspath);
-	size_t pathlen;
+	size_t pathlen = strlen(path);
 	char childpath[PATH_MAX];
 	LinkTable *linktbl;
 
-	if (!path)
+	if (!pathlen)
 		return -EINVAL;
 
-	if (!*path || !strcmp(path, "/")) {
+	if (!strcmp(path, ".")) {
 		linktbl = ROOT_LINK_TBL;
 	} else {
 		linktbl = path_to_Link_LinkTable_new(path);
@@ -53,7 +57,6 @@ static int fs_readdir(int fanotify_fd, const char *abspath)
 		}
 	}
 
-	pathlen = strlen(path);
 	strcpy(childpath, path);
 	childpath[pathlen++] = '/';
 
@@ -72,15 +75,14 @@ static int fs_readdir(int fanotify_fd, const char *abspath)
 			default:
 				continue;
 		}
-		fanotify_add_watch(fanotify_fd, childpath);
+		fanotify_add_data_watch(fanotify_fd, childpath);
 	}
 
 	return 0;
 }
 
-static int fs_read(const char *abspath, off_t offset, size_t size)
+static int fs_read(const char *path, off_t offset, size_t size)
 {
-	const char *path = Data_relpath(abspath);
 	Link *link = path_to_Link(path);
 	if (!link)
 		return -ENOENT;
@@ -104,6 +106,7 @@ static void handle_events(int fanotify_fd)
 	struct fanotify_event_metadata buf[200];
 	ssize_t len;
 	char abspath[PATH_MAX];
+	const char *relpath;
 	ssize_t path_len;
 	char procfd_path[PATH_MAX];
 	struct fanotify_response response;
@@ -126,10 +129,14 @@ static void handle_events(int fanotify_fd)
 		if (path_len == -1)
 			exit_perror("readlink");
 
+		ret = 0;
 		abspath[path_len] = '\0';
+		relpath = Data_relpath(metadata->fd, abspath);
+		if (!relpath)
+			exit_error("Unexpected path in event");
 
-		lprintf(debug, "Got event 0x%08x on '%s'\n",
-			metadata->mask, abspath);
+		lprintf(debug, "Got event 0x%08x on '%s' (%s)\n",
+			metadata->mask, abspath, relpath);
 
 		struct stat st;
 		if (fstat(metadata->fd, &st))
@@ -137,14 +144,18 @@ static void handle_events(int fanotify_fd)
 
 		switch (st.st_mode & S_IFMT) {
 			case S_IFDIR:
+				/* Empty relative path meants event on data root dir -
+				 * use relative path "." for syscalls that do not support AT_EMPTY_PATH */
+				if (!*relpath)
+					relpath = ".";
 				/* Allow dir to be accessed if all cache entries are created */
 				/* TODO: populate a single child entry on FAN_LOOKUP_PERM event */
-				ret = fs_readdir(fanotify_fd, abspath);
+				ret = fs_readdir(fanotify_fd, relpath);
 				break;
 			case S_IFREG:
 				/* Allow file to be accessed if all the file data is downloaded */
 				/* TODO: download range if we can get it from FAN_ACCESS_PERM event */
-				ret = fs_read(abspath, 0, st.st_size);
+				ret = fs_read(relpath, 0, st.st_size);
 				break;
 			default:
 				ret = -EPERM;
@@ -154,7 +165,7 @@ static void handle_events(int fanotify_fd)
 		response.response = ret ? FAN_DENY : FAN_ALLOW;
 		write(fanotify_fd, &response, sizeof(struct fanotify_response));
 		if (!ret)
-			fanotify_remove_watch(fanotify_fd, abspath);
+			fanotify_remove_data_watch(fanotify_fd, relpath);
 
 		close(metadata->fd);
 		metadata = FAN_EVENT_NEXT(metadata, len);
@@ -170,7 +181,7 @@ int fanotify_main()
 		exit_perror("fanotify_init");
 
 	/* Hook on first access to data root dir */
-	fanotify_add_watch(fanotify_fd, "");
+	fanotify_add_data_watch(fanotify_fd, ".");
 
 	for (;;)
 		handle_events(fanotify_fd);

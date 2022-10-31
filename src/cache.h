@@ -87,6 +87,11 @@ extern char *META_DIR;
 extern char *DATA_DIR;
 
 /**
+ * \brief Open fd to data directory
+ */
+extern int DATA_DIR_fd;
+
+/**
  * \brief convert relative data path to absolute path
  * \return string to be freed by caller
  */
@@ -96,7 +101,7 @@ char *Data_abspath(const char *relpath);
  * \brief convert absolute data path to relative path
  * \return pointer into input string or NULL
  */
-const char *Data_relpath(const char *abspath);
+const char *Data_relpath(int dirfd, const char *abspath);
 
 /**
  * \brief initialise the cache system directories
