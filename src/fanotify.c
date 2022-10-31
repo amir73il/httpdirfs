@@ -4,9 +4,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <sys/fanotify.h>
 
 #ifndef FAN_LOOKUP_PERM
@@ -221,6 +223,79 @@ static void handle_events(int fanotify_fd)
 	}
 }
 
+static int fanotify_bind_mounted;
+
+static void fanotify_mount_cleanup()
+{
+	if (CONFIG.mount_dir)
+		umount(CONFIG.mount_dir);
+	umount(DATA_DIR);
+	umount(DATA_DIR);
+}
+
+static void fanotify_cleanup(int sig)
+{
+	(void) sig;	/* unused */
+
+	if (DATA_DIR_fd > 0)
+		close(DATA_DIR_fd);
+
+	if (fanotify_bind_mounted)
+		fanotify_mount_cleanup();
+
+	exit_error("Terminated by signal");
+}
+
+static void set_signal_handler(int sig, void (*handler)(int))
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(struct sigaction));
+	sa.sa_handler = handler;
+	sigemptyset(&(sa.sa_mask));
+	sa.sa_flags = 0;
+
+	if (sigaction(sig, &sa, NULL))
+		exit_perror("sigaction");
+}
+
+void fanotify_watch_data_dir(int fanotify_fd)
+{
+	set_signal_handler(SIGINT, fanotify_cleanup);
+	set_signal_handler(SIGTERM, fanotify_cleanup);
+
+	/* Cleanup old mounts */
+	fanotify_mount_cleanup();
+
+	/*
+	 * Create bind mount and move it to mount dir.
+	 * We need to create a private parent bind mount from which
+	 * the child mount can be moved.
+	 */
+	if (CONFIG.mount_dir &&
+	    (mount(DATA_DIR, DATA_DIR, NULL, MS_BIND, NULL) ||
+	     mount(NULL, DATA_DIR, NULL, MS_PRIVATE, NULL))) {
+		fanotify_mount_cleanup();
+		exit_perror("make-priavte mount data dir");
+	}
+
+
+	fanotify_bind_mounted = !mount(DATA_DIR, DATA_DIR, NULL, MS_BIND, NULL);
+	if (!fanotify_bind_mounted) {
+		fanotify_mount_cleanup();
+		exit_perror("bind mount data dir");
+	}
+
+	if (CONFIG.mount_dir &&
+	    mount(DATA_DIR, CONFIG.mount_dir, NULL, MS_MOVE, NULL)) {
+		fanotify_mount_cleanup();
+		exit_perror("move mount data dir");
+	}
+
+	/* Hook on first access to data root dir */
+	fanotify_add_data_watch(fanotify_fd, ".");
+}
+
 int fanotify_main()
 {
 	int fanotify_fd;
@@ -229,8 +304,8 @@ int fanotify_main()
 	if (fanotify_fd < 0)
 		exit_perror("fanotify_init");
 
-	/* Hook on first access to data root dir */
-	fanotify_add_data_watch(fanotify_fd, ".");
+	/* Watch events on data or mount dir */
+	fanotify_watch_data_dir(fanotify_fd);
 
 	for (;;)
 		handle_events(fanotify_fd);

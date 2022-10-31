@@ -82,7 +82,10 @@ int main(int argc, char **argv)
     }
 
     /*--- Add the last remaining argument, which is the mountpoint ---*/
-    add_arg(&fuse_argv, &fuse_argc, argv[argc - 1]);
+    char *path = argv[argc - 1];
+    add_arg(&fuse_argv, &fuse_argc, path);
+    if (strcmp(path, "-"))
+        CONFIG.mount_dir = path;
 
     /*
      * The second last remaining argument is the URL
