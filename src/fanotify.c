@@ -140,10 +140,8 @@ static int handle_access_event(int fanotify_fd,
 			offset = lseek(event->fd, 0, SEEK_HOLE);
 			if (offset < 0)
 				ret = -errno;
-			else if (offset == st->st_size)
-				ret = 0;
 			else
-				ret = fs_read(relpath, event->fd, offset, 1);
+				ret = fs_read(relpath, event->fd, st->st_size, 1);
 			break;
 		default:
 			ret = -EPERM;
