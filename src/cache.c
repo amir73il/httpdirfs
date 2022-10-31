@@ -33,6 +33,8 @@ static pthread_mutex_t cf_lock;
  * \brief The data directory
  */
 char *DATA_DIR;
+static char *MNT_DIR;
+static size_t MNT_DIR_len;
 static size_t DATA_DIR_len;
 int DATA_DIR_fd = AT_FDCWD;
 
@@ -46,34 +48,55 @@ char *Data_abspath(const char *relpath)
 }
 
 /**
+ * \brief convert absolute path to relative path
+ * \return pointer into input string or NULL
+ */
+static const char *__relpath(const char *abspath, const char *prefix, size_t prefix_len)
+{
+    size_t pathlen = strlen(abspath);
+    if (pathlen < prefix_len ||
+        strncmp(abspath, prefix, prefix_len)) {
+        return NULL;
+    }
+
+    /* Strip the / prefix from relative path */
+    while (abspath[prefix_len] == '/') {
+        abspath++;
+        pathlen--;
+    }
+
+    return abspath + prefix_len;
+}
+
+/**
  * \brief convert absolute data path to relative path
  * \return pointer into input string or NULL
  */
 const char *Data_relpath(int dirfd, const char *abspath)
 {
-    size_t pathlen = strlen(abspath);
-    if (pathlen < DATA_DIR_len ||
-        strncmp(abspath, DATA_DIR, DATA_DIR_len)) {
+    const char *relpath = NULL;
+
+    if (MNT_DIR)
+        relpath = __relpath(abspath, MNT_DIR, MNT_DIR_len);
+
+    if (!relpath)
+        relpath = __relpath(abspath, DATA_DIR, DATA_DIR_len);
+
+    if (!relpath) {
         lprintf(warning, "'%s' is not under '%.*s'\n",
                 abspath, (int)DATA_DIR_len, DATA_DIR);
         return NULL;
     }
 
-    /* Strip the / prefix from relative path */
-    while (abspath[DATA_DIR_len] == '/') {
-        abspath++;
-        pathlen--;
-    }
-
     /* Store data dir dirfd if relpath is empty */
-    if (DATA_DIR_fd < 0 && dirfd > 0 && pathlen == DATA_DIR_len) {
+    if (DATA_DIR_fd < 0 && dirfd > 0 && !*relpath) {
         int fd = dup(dirfd);
         if (fd > 0)
             DATA_DIR_fd = fd;
         lprintf(debug, "DATA_DIR_fd = %d\n", DATA_DIR_fd);
     }
 
-    return abspath + DATA_DIR_len;
+    return relpath;
 }
 
 /**
@@ -163,6 +186,13 @@ void CacheSystem_init(const char *path, int url_supplied)
     /* chdir into DATA_DIR so we can use relative paths */
     if (chdir(DATA_DIR))
         exit_perror("chdir");
+
+    if (CONFIG.mount_dir) {
+        MNT_DIR = CONFIG.mount_dir;
+        MNT_DIR_len = strlen(MNT_DIR);
+        if (MNT_DIR[MNT_DIR_len - 1] == '/')
+            MNT_DIR_len--;
+    }
 
     if (CONFIG.mode == SONIC) {
         char *sonic_path;
