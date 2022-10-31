@@ -187,6 +187,12 @@ void CacheSystem_init(const char *path, int url_supplied)
     if (chdir(DATA_DIR))
         exit_perror("chdir");
 
+    /* Open data dir dirfd before bind mount */
+    int fd = open(DATA_DIR, O_PATH);
+    if (fd > 0)
+        DATA_DIR_fd = fd;
+    lprintf(debug, "DATA_DIR_fd = %d\n", DATA_DIR_fd);
+
     if (CONFIG.mount_dir) {
         MNT_DIR = CONFIG.mount_dir;
         MNT_DIR_len = strlen(MNT_DIR);

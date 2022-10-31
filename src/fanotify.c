@@ -11,35 +11,68 @@
 #include <sys/mount.h>
 #include <sys/fanotify.h>
 
+#ifndef FAN_XATTR_IGNORE_MASK
+#define FAN_XATTR_IGNORE_MASK 0x00010000
+#endif
+
+#ifndef FAN_MARK_IGNORE
+#define FAN_MARK_IGNORE 0x00000400
+#endif
+#ifndef FAN_MARK_SYNC
+#define FAN_MARK_SYNC	0x00000800
+#endif
+#ifndef FAN_MARK_XATTR
+#define FAN_MARK_XATTR  0x00001000
+#endif
+#ifndef FAN_MARK_IGNORE_SURV
+#define FAN_MARK_IGNORE_SURV (FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY)
+#endif
+
 #ifndef FAN_LOOKUP_PERM
 #define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
 #endif
 
+#define FAN_INIT_FLAGS	(FAN_CLASS_PRE_CONTENT | FAN_XATTR_IGNORE_MASK)
 #define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
-#define FAN_EVENTS	(FAN_PRE_ACCESS)
+#define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS)
 
-static void fanotify_add_data_watch(int fanotify_fd, const char *path)
+static void fanotify_add_root_watch(int fanotify_fd, const char *path)
 {
-	if (fanotify_mark(fanotify_fd, FAN_MARK_ADD, FAN_EVENTS | FAN_ONDIR,
-			  DATA_DIR_fd, path)) {
+	if (fanotify_mark(fanotify_fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+			  FAN_EVENTS | FAN_ONDIR, AT_FDCWD, path))
+		exit_perror("add data dir root mark");
+
+	lprintf(info, "Added mount watch on '%s'\n", path);
+}
+
+static void fanotify_add_data_watch(int fanotify_fd, const char *path, int is_dir)
+{
+	/* Add persistent inode mark with ignore mask to stop getting open events */
+	int flags = FAN_MARK_ADD | FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+	uint64_t mask = FAN_OPEN_PERM | (is_dir ? FAN_ONDIR : 0);
+
+	if (fanotify_mark(fanotify_fd, flags, mask, DATA_DIR_fd, path)) {
 		lprintf(warning, "Failed adding watch on '%s' (%s)\n",
 			path, strerror(errno));
 		return;
 	}
 
-	lprintf(info, "Added watch on '%s'\n", path);
+	lprintf(info, "Added data watch on '%s'\n", path);
 }
 
-static void fanotify_remove_data_watch(int fanotify_fd, const char *path)
+static void fanotify_remove_data_watch(int fanotify_fd, const char *path, int is_dir)
 {
-	if (fanotify_mark(fanotify_fd, FAN_MARK_REMOVE, FAN_EVENTS | FAN_ONDIR,
-			  DATA_DIR_fd, path)) {
+	/* Add persistent inode mark with ignore mask to stop getting access events */
+	int flags = FAN_MARK_ADD | FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+	uint64_t mask = FAN_PRE_ACCESS | (is_dir ? FAN_ONDIR : 0);
+
+	if (fanotify_mark(fanotify_fd, flags, mask, DATA_DIR_fd, path)) {
 		lprintf(warning, "Failed removing watch on '%s' (%s)\n",
 			path, strerror(errno));
 		return;
 	}
 
-	lprintf(info, "Removed watch on '%s'\n", path);
+	lprintf(info, "Removed data watch on '%s'\n", path);
 }
 
 static int fs_readdir(int fanotify_fd, const char *path)
@@ -78,7 +111,8 @@ static int fs_readdir(int fanotify_fd, const char *path)
 			default:
 				continue;
 		}
-		fanotify_add_data_watch(fanotify_fd, childpath);
+		/* Allow open and watch for data access */
+		fanotify_add_data_watch(fanotify_fd, childpath, link->type == LINK_DIR);
 	}
 
 	return 0;
@@ -194,9 +228,10 @@ static void handle_events(int fanotify_fd)
 		response.fd = metadata->fd;
 		response.response = ret < 0 ? FAN_DENY : FAN_ALLOW;
 		write(fanotify_fd, &response, sizeof(struct fanotify_response));
-		if (!ret)
-			fanotify_remove_data_watch(fanotify_fd, relpath);
-
+		if (!ret) {
+			fanotify_remove_data_watch(fanotify_fd, relpath,
+						   st.st_mode & S_IFDIR);
+		}
 		close(metadata->fd);
 		metadata = FAN_EVENT_NEXT(metadata, len);
 	}
@@ -261,21 +296,24 @@ void fanotify_watch_data_dir(int fanotify_fd)
 		exit_perror("bind mount data dir");
 	}
 
+	/* Hook on any access to bind mount before moving into place */
+	fanotify_add_root_watch(fanotify_fd, DATA_DIR);
+
 	if (CONFIG.mount_dir &&
 	    mount(DATA_DIR, CONFIG.mount_dir, NULL, MS_MOVE, NULL)) {
 		fanotify_mount_cleanup();
 		exit_perror("move mount data dir");
 	}
 
-	/* Hook on first access to data root dir */
-	fanotify_add_data_watch(fanotify_fd, ".");
+	/* Allow open of data root dir */
+	fanotify_add_data_watch(fanotify_fd, ".", 1);
 }
 
 int fanotify_main()
 {
 	int fanotify_fd;
 
-	fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDWR | O_LARGEFILE);
+	fanotify_fd = fanotify_init(FAN_INIT_FLAGS, O_RDWR | O_LARGEFILE);
 	if (fanotify_fd < 0)
 		exit_perror("fanotify_init");
 
