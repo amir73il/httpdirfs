@@ -977,6 +977,20 @@ static int Seg_exist(Cache *cf, off_t offset)
 }
 
 /**
+ * \brief Check for missing segment.
+ * \return first offset of segment that does not exists
+ */
+static off_t Seg_hole(Cache *cf)
+{
+    off_t byte;
+    for (byte = 0; byte < cf->segbc; byte++) {
+        if (!cf->seg[byte])
+            return byte * cf->blksz;
+    }
+    return cf->content_length;
+}
+
+/**
  * \brief Set the existence of a segment
  * \param[in] cf the cache in-memory data structure
  * \param[in] offset the starting position of the segment.
@@ -1048,6 +1062,16 @@ Cache_read(Cache *cf, char *const output_buf, const off_t len,
      * The offset of the segment to be downloaded
      */
     off_t dl_offset = (offset_start + len) / cf->blksz * cf->blksz;
+
+    /*
+     * Requesting read from EOF - download first missing segment
+     * and if nothing is missing return zero read bytes.
+     */
+    if (offset_start == cf->content_length) {
+        dl_offset = Seg_hole(cf);
+	if (dl_offset == cf->content_length)
+            return 0;
+    }
 
     /*
      * ------------- Check if the segment already exists --------------
