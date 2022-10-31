@@ -101,7 +101,7 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
         return -EROFS;
     }
     if (CACHE_SYSTEM_INIT) {
-        fi->fh = (uint64_t) Cache_open(path);
+        fi->fh = (uint64_t) Cache_open(path, 0);
         if (!fi->fh) {
             /*
              * The link clearly exists, the cache cannot be opened, attempt
@@ -109,7 +109,7 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
              */
             Cache_delete(path);
             Cache_create(path);
-            fi->fh = (uint64_t) Cache_open(path);
+            fi->fh = (uint64_t) Cache_open(path, 0);
             /*
              * The cache definitely cannot be opened for some reason.
              */

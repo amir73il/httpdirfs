@@ -129,7 +129,7 @@ int CacheDir_create(const char *fn);
  * \brief open a cache file set
  * \note This function is called by fs_open()
  */
-Cache *Cache_open(const char *fn);
+Cache *Cache_open(const char *fn, int data_fd);
 
 /**
  * \brief Close a cache data structure

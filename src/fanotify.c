@@ -81,13 +81,15 @@ static int fs_readdir(int fanotify_fd, const char *path)
 	return 0;
 }
 
-static int fs_read(const char *path, off_t offset, size_t size)
+static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
 {
 	Link *link = path_to_Link(path);
 	if (!link)
 		return -ENOENT;
 
-	Cache *cache = Cache_open(path);
+	/* Use the fd provided by fanotify to write to cache data file
+	 * to avoid deadlocks */
+	Cache *cache = Cache_open(path, data_fd);
 	if (!cache)
 		return -ENOENT;
 
@@ -96,7 +98,7 @@ static int fs_read(const char *path, off_t offset, size_t size)
 
 	Cache_close(cache);
 
-	return recv != (long)size;
+	return recv;
 }
 
 
@@ -105,6 +107,7 @@ static void handle_events(int fanotify_fd)
 	const struct fanotify_event_metadata *metadata;
 	struct fanotify_event_metadata buf[200];
 	ssize_t len;
+	off_t offset;
 	char abspath[PATH_MAX];
 	const char *relpath;
 	ssize_t path_len;
@@ -153,16 +156,24 @@ static void handle_events(int fanotify_fd)
 				ret = fs_readdir(fanotify_fd, relpath);
 				break;
 			case S_IFREG:
-				/* Allow file to be accessed if all the file data is downloaded */
-				/* TODO: download range if we can get it from FAN_ACCESS_PERM event */
-				ret = fs_read(relpath, 0, st.st_size);
+				/* Allow file to be accessed if all the file data is downloaded
+				 * or if any block was downloaded, so reading the file sequetially
+				 * to a read buffer smaller than download block size will work.
+				 * TODO: download requested if we can get it from FAN_ACCESS_PERM event */
+				offset = lseek(metadata->fd, 0, SEEK_HOLE);
+				if (offset < 0)
+					ret = -errno;
+				else if (offset == st.st_size)
+					ret = 0;
+				else
+					ret = fs_read(relpath, metadata->fd, offset, 1);
 				break;
 			default:
 				ret = -EPERM;
 		}
 
 		response.fd = metadata->fd;
-		response.response = ret ? FAN_DENY : FAN_ALLOW;
+		response.response = ret < 0 ? FAN_DENY : FAN_ALLOW;
 		write(fanotify_fd, &response, sizeof(struct fanotify_response));
 		if (!ret)
 			fanotify_remove_data_watch(fanotify_fd, relpath);
@@ -176,7 +187,7 @@ int fanotify_main()
 {
 	int fanotify_fd;
 
-	fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDONLY | O_LARGEFILE);
+	fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDWR | O_LARGEFILE);
 	if (fanotify_fd < 0)
 		exit_perror("fanotify_init");
 

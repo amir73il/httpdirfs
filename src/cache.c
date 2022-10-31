@@ -653,9 +653,13 @@ void Cache_delete(const char *fn)
  *  -   0 on success
  *  -   -1 on failure, with appropriate errno set.
  */
-static int Data_open(Cache *cf)
+static int Data_open(Cache *cf, int data_fd)
 {
-    int fd = openat(DATA_DIR_fd, cf->path, O_RDWR);
+    int fd;
+    if (data_fd)
+        fd = dup(data_fd);
+    else
+        fd = openat(DATA_DIR_fd, cf->path, O_RDWR);
     cf->dfp = fd > 0 ? fdopen(fd, "r+") : NULL;
     if (!cf->dfp) {
         /*
@@ -777,7 +781,7 @@ int Cache_create(const char *path)
     return res;
 }
 
-Cache *Cache_open(const char *fn)
+Cache *Cache_open(const char *fn, int data_fd)
 {
     /*
      * Obtain the link structure memory pointer
@@ -904,7 +908,7 @@ cf->content_length: %ld, Data_size(fn): %ld.\n", fn, cf->content_length,
         return NULL;
     }
 
-    if (Data_open(cf)) {
+    if (Data_open(cf, data_fd)) {
         Cache_free(cf);
         lprintf(error, "cannot open data file %s.\n", fn);
 
