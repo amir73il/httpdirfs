@@ -45,6 +45,24 @@ static void fanotify_add_root_watch(int fanotify_fd, const char *path)
 	lprintf(info, "Added mount watch on '%s'\n", path);
 }
 
+/* After this call, future open syscalls are denied by the mark mount */
+static int fanotify_reset_data_watch(int fanotify_fd, const char *path)
+{
+	/* Remove persistent inode mark with ignore mask to start getting open events */
+	int flags = FAN_MARK_REMOVE | FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+
+	if (fanotify_mark(fanotify_fd, flags, FAN_EVENTS, DATA_DIR_fd, path) &&
+			errno != ENOENT) {
+		lprintf(warning, "Failed reseting watch on '%s' (%s)\n",
+			path, strerror(errno));
+		return -1;
+	}
+
+	lprintf(info, "Reset data watch on '%s'\n", path);
+	return 0;
+}
+
+/* After this call, future open syscalls are allowed */
 static int fanotify_add_data_watch(int fanotify_fd, const char *path, int is_dir)
 {
 	/* Add persistent inode mark with ignore mask to stop getting open events */
@@ -349,4 +367,87 @@ int fanotify_main()
 
 	close(fanotify_fd);
 	return 0;
+}
+
+/*
+ * Standalone command to evict a file's cache and monitor service
+ * manipulate the same persistent xattr ignore marks, but through
+ * independent fanotify groups.
+ */
+static int fanotify_evict_fd;
+static const char *fanotify_evict_path;
+
+static void fanotify_evict_cleanup(int sig)
+{
+	if (fanotify_evict_fd &&
+	    fanotify_add_data_watch(fanotify_evict_fd, fanotify_evict_path, 0))
+		exit_error("Failed allowing opens.");
+
+	if (sig)
+		exit_error("Terminated by signal");
+}
+
+int fanotify_evict(const char *path)
+{
+	const char *relpath = Data_relpath(AT_FDCWD, path);
+	int fanotify_fd;
+	int ret = 1;
+
+	if (!relpath)
+		exit_error("Path to evict is not cached");
+
+	fanotify_fd = fanotify_init(FAN_INIT_FLAGS, 0);
+	if (fanotify_fd < 0)
+		exit_perror("fanotify_init");
+
+	fanotify_evict_fd = fanotify_fd;
+	fanotify_evict_path = relpath;
+	set_signal_handler(SIGIO, fanotify_evict_cleanup);
+	set_signal_handler(SIGINT, fanotify_evict_cleanup);
+	set_signal_handler(SIGTERM, fanotify_evict_cleanup);
+	/* Recover from aborted evict */
+	fanotify_evict_cleanup(0);
+
+	int fd = openat(DATA_DIR_fd, relpath, O_RDWR | O_NONBLOCK);
+	if (fd < 0)
+		exit_perror(path);
+
+	struct stat st;
+	if (fstat(fd, &st))
+		exit_perror("fstat");
+
+	if (!(st.st_mode & S_IFREG))
+		exit_error("Only regular file cache can be evicted.");
+
+	/*
+	 * Acquire write lease to make sure no open fds.
+	 */
+	if (fcntl(fd, F_SETLEASE, F_WRLCK))
+		exit_error("File is open and cannot be evicted.");
+
+	if (fanotify_reset_data_watch(fanotify_fd, path))
+		exit_error("Failed denying opens.");
+
+	lprintf(info, "Starting file '%s' cache eviction.\n", path);
+
+	/*
+	 * Now fanotify HSM will deny new opens.
+	 * Reacquire write lease to make sure no opens in progress.
+	 */
+	if (fcntl(fd, F_SETLEASE, F_UNLCK) || fcntl(fd, F_SETLEASE, F_WRLCK)) {
+		lprintf(warning, "File '%s' is open - cache eviction aborted!\n",
+			path);
+		goto out;
+	}
+
+	/* Reset cache entry by removing meta file and punching data file */
+	Cache_delete(relpath, fd);
+
+	lprintf(info, "File '%s' cache was evicted!\n", path);
+	ret = 0;
+out:
+	fanotify_evict_cleanup(0);
+	close(fanotify_fd);
+	close(fd);
+	return ret;
 }

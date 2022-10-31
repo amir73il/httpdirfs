@@ -87,6 +87,12 @@ int main(int argc, char **argv)
     if (strcmp(path, "-"))
         CONFIG.mount_dir = path;
 
+    /* URL is ignored for evict-file command */
+    if (CONFIG.evict_file) {
+        CacheSystem_init(CONFIG.cache_dir, 0);
+        return fanotify_evict(CONFIG.evict_file);
+    }
+
     /*
      * The second last remaining argument is the URL
      */
@@ -203,7 +209,8 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
         { "insecure-tls", no_argument, NULL, 'L' },     /* 20 */
         { "config", required_argument, NULL, 'L' },     /* 21 */
         { "single-file-mode", required_argument, NULL, 'L' },   /* 22 */
-        { "fanotify", no_argument, NULL, 'L' },    /* 23 */
+        { "evict-file", required_argument, NULL, 'L' },   /* 23 */
+        { "fanotify", no_argument, NULL, 'L' },    /* 24 */
         { 0, 0, 0, 0 }
     };
     while ((c =
@@ -304,6 +311,10 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
                 CONFIG.mode = SINGLE;
                 break;
             case 23:
+		/* File evict command */
+                CONFIG.evict_file = strdup(optarg);
+                /* fallthrough */
+            case 24:
                 CONFIG.fanotify_enabled = 1;
                 CONFIG.cache_enabled = 1;
                 break;
@@ -383,6 +394,8 @@ HTTPDirFS options:\n\
                             directory.\n\
         --fanotify          fanotify mode - rather than mounting FUSE, populate\n\
                             files on access to cache data dir (implies --cache).\n\
+        --evict-file        Invalidate and evict a file's cache (implies --cache).\n\
+                            The file path is the last argument (instead of mountpoint).\n\
 \n\
     For mounting a Airsonic / Subsonic server:\n\
         --sonic-username    The username for your Airsonic / Subsonic server\n\

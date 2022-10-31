@@ -62,6 +62,8 @@ void Config_init(void)
 
     CONFIG.mount_dir = NULL;
 
+    CONFIG.evict_file = NULL;
+
     CONFIG.data_blksz = DEFAULT_DATA_BLKSZ;
 
     CONFIG.max_segbc = DEFAULT_MAX_SEGBC;

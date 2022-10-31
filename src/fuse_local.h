@@ -12,4 +12,7 @@ int fuse_local_init(int argc, char **argv);
 /* Initialise fanotify and run event loop */
 int fanotify_main();
 
+/* Evict a file cache */
+int fanotify_evict(const char *path);
+
 #endif
