@@ -35,9 +35,16 @@
 #ifndef FAN_LOOKUP_PERM
 #define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
 #endif
+#ifndef FAN_MODIFY_PERM
+#define FAN_MODIFY_PERM	0x00100000 /* Pre data modify */
+#endif
+#ifndef FAN_ATTRIB_PERM
+#define FAN_ATTRIB_PERM	0x00200000 /* Pre metadata change */
+#endif
+#define FAN_PRE_DIRENT	0x01c00000 /* create/delete/rename */
 
-#define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
-#define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS)
+#define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM | FAN_MODIFY_PERM)
+#define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_DIRENT)
 
 #ifndef FAN_DENY_ERROR
 #define FAN_DENY_ERROR	0x03
@@ -190,6 +197,10 @@ static int handle_access_event(int fanotify_fd,
 		default:
 			ret = -EPERM;
 	}
+
+	/* Deny modify content and truncate if cache is not fully populated */
+	if (ret > 0 && event->mask & FAN_MODIFY_PERM)
+		ret = -EROFS;
 
 	return ret;
 }
