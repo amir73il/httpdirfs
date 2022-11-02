@@ -16,6 +16,17 @@
 #define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
 #define FAN_EVENTS	(FAN_PRE_ACCESS)
 
+#ifndef FAN_DENY_ERROR
+#define FAN_DENY_ERROR	0x03
+
+struct fanotify_response_error {
+	__s32 fd;
+	__u32 response  :16,
+	      error     :8,
+	      reserved  :8;
+};
+#endif
+
 static void fanotify_add_data_watch(int fanotify_fd, const char *path)
 {
 	if (fanotify_mark(fanotify_fd, FAN_MARK_ADD, FAN_EVENTS | FAN_ONDIR,
@@ -104,7 +115,7 @@ static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
 
 /*
  * Return values:
- * <0 to deny access
+ * <0 to deny access and return error
  * >0 allow acces but keep watching
  *  0 allow access and stop watching
  */
@@ -150,7 +161,7 @@ static void handle_events(int fanotify_fd)
 	const char *relpath;
 	ssize_t path_len;
 	char procfd_path[PATH_MAX];
-	struct fanotify_response response;
+	struct fanotify_response_error response;
 	int ret;
 
 	len = read(fanotify_fd, (void *) &buf, sizeof(buf));
@@ -196,7 +207,13 @@ static void handle_events(int fanotify_fd)
 		}
 
 		response.fd = metadata->fd;
-		response.response = ret < 0 ? FAN_DENY : FAN_ALLOW;
+		if (ret < 0) {
+			response.response = FAN_DENY_ERROR;
+			response.error = -ret;
+		} else {
+			response.response = FAN_ALLOW;
+			response.error = 0;
+		}
 		write(fanotify_fd, &response, sizeof(struct fanotify_response));
 		if (!ret)
 			fanotify_remove_data_watch(fanotify_fd, relpath);
