@@ -14,7 +14,11 @@
 #ifndef FAN_XATTR_IGNORE_MASK
 #define FAN_XATTR_IGNORE_MASK 0x00010000
 #endif
+#define FAN_INIT_XATTR_FLAGS (FAN_CLASS_PRE_CONTENT | FAN_XATTR_IGNORE_MASK)
 
+#ifndef FAN_MARK_EVICTABLE
+#define FAN_MARK_EVICTABLE 0x00000200
+#endif
 #ifndef FAN_MARK_IGNORE
 #define FAN_MARK_IGNORE 0x00000400
 #endif
@@ -45,11 +49,13 @@ static void fanotify_add_root_watch(int fanotify_fd, const char *path)
 	lprintf(info, "Added mount watch on '%s'\n", path);
 }
 
+static int ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+
 /* After this call, future open syscalls are denied by the mark mount */
 static int fanotify_reset_data_watch(int fanotify_fd, const char *path)
 {
-	/* Remove persistent inode mark with ignore mask to start getting open events */
-	int flags = FAN_MARK_REMOVE | FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+	/* Remove inode mark with ignore mask to start getting open events */
+	int flags = FAN_MARK_REMOVE | ignore_mark_flags;
 
 	if (fanotify_mark(fanotify_fd, flags, FAN_EVENTS, DATA_DIR_fd, path) &&
 			errno != ENOENT) {
@@ -65,8 +71,8 @@ static int fanotify_reset_data_watch(int fanotify_fd, const char *path)
 /* After this call, future open syscalls are allowed */
 static int fanotify_add_data_watch(int fanotify_fd, const char *path, int is_dir)
 {
-	/* Add persistent inode mark with ignore mask to stop getting open events */
-	int flags = FAN_MARK_ADD | FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+	/* Add inode mark with ignore mask to stop getting open events */
+	int flags = FAN_MARK_ADD | ignore_mark_flags;
 	uint64_t mask = FAN_OPEN_PERM | (is_dir ? FAN_ONDIR : 0);
 
 	if (fanotify_mark(fanotify_fd, flags, mask, DATA_DIR_fd, path)) {
@@ -81,8 +87,8 @@ static int fanotify_add_data_watch(int fanotify_fd, const char *path, int is_dir
 
 static void fanotify_remove_data_watch(int fanotify_fd, const char *path, int is_dir)
 {
-	/* Add persistent inode mark with ignore mask to stop getting access events */
-	int flags = FAN_MARK_ADD | FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
+	/* Add inode mark with ignore mask to stop getting access events */
+	int flags = FAN_MARK_ADD | ignore_mark_flags;
 	uint64_t mask = FAN_PRE_ACCESS | (is_dir ? FAN_ONDIR : 0);
 
 	if (fanotify_mark(fanotify_fd, flags, mask, DATA_DIR_fd, path)) {
@@ -355,7 +361,13 @@ int fanotify_main()
 {
 	int fanotify_fd;
 
-	fanotify_fd = fanotify_init(FAN_INIT_FLAGS, O_RDWR | O_LARGEFILE);
+	fanotify_fd = fanotify_init(FAN_INIT_XATTR_FLAGS, O_RDWR | O_LARGEFILE);
+	if (fanotify_fd < 0) {
+		/* Persistent marks not supported - fallback to evictable marks */
+		ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_EVICTABLE;
+		fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT,
+					    O_RDWR | O_LARGEFILE);
+	}
 	if (fanotify_fd < 0)
 		exit_perror("fanotify_init");
 
