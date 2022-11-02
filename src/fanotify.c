@@ -5,8 +5,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/fanotify.h>
@@ -56,6 +58,10 @@ struct fanotify_response_error {
 	      reserved  :8;
 };
 #endif
+
+struct fanotify_group {
+	int fd;
+};
 
 static int ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
 
@@ -301,6 +307,16 @@ static void handle_events(int fanotify_fd)
 	}
 }
 
+static void *events_loop(void *group)
+{
+	int fanotify_fd = ((struct fanotify_group *)group)->fd;
+
+	for (;;)
+		handle_events(fanotify_fd);
+
+	return NULL;
+}
+
 static int fanotify_bind_mounted;
 
 static void fanotify_mount_cleanup()
@@ -321,7 +337,10 @@ static void fanotify_cleanup(int sig)
 	if (fanotify_bind_mounted)
 		fanotify_mount_cleanup();
 
-	exit_error("Terminated by signal");
+	if (sig)
+		exit_error("Terminated by signal");
+	else
+		exit_error("Quit by user");
 }
 
 static void set_signal_handler(int sig, void (*handler)(int))
@@ -374,26 +393,57 @@ void fanotify_watch_data_dir(int fanotify_fd)
 	}
 }
 
+/********************************************/
+/* Console commands                         */
+/********************************************/
+
+void handle_command(int fanotify_fd)
+{
+	static char *line = NULL;
+	static size_t len = 0;
+	ssize_t nread;
+
+	nread = getline(&line, &len, stdin);
+	if (nread <= 0)
+		exit_perror("getline");
+	line[nread - 1] = 0;
+
+	switch (*line) {
+		case '\0':
+			return;
+		case 'q':
+			fanotify_cleanup(0);
+			break;
+	}
+
+	lprintf(warning, "Unknown command: %s", line);
+}
+
 int fanotify_main()
 {
-	int fanotify_fd;
+	struct fanotify_group fanotify;
+	pthread_t watcher;
 
-	fanotify_fd = fanotify_init(FAN_INIT_XATTR_FLAGS, O_RDWR | O_LARGEFILE);
-	if (fanotify_fd < 0) {
+	fanotify.fd = fanotify_init(FAN_INIT_XATTR_FLAGS, O_RDWR | O_LARGEFILE);
+	if (fanotify.fd < 0) {
 		/* Persistent marks not supported - fallback to evictable marks */
 		ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_EVICTABLE;
-		fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT,
+		fanotify.fd = fanotify_init(FAN_CLASS_PRE_CONTENT,
 					    O_RDWR | O_LARGEFILE);
 	}
-	if (fanotify_fd < 0)
+	if (fanotify.fd < 0)
 		exit_perror("fanotify_init");
 
 	/* Watch events on data or mount dir */
-	fanotify_watch_data_dir(fanotify_fd);
+	fanotify_watch_data_dir(fanotify.fd);
+
+	if (pthread_create(&watcher, NULL, events_loop, (void*)&fanotify))
+		exit_perror("start event watcher");
 
 	for (;;)
-		handle_events(fanotify_fd);
+		handle_command(fanotify.fd);
 
-	close(fanotify_fd);
+	pthread_join(watcher, NULL);
+	close(fanotify.fd);
 	return 0;
 }
