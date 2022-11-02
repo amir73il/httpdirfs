@@ -11,11 +11,22 @@
 #include <sys/mount.h>
 #include <sys/fanotify.h>
 
+#ifndef FAN_XATTR_IGNORE_MASK
+#define FAN_XATTR_IGNORE_MASK 0x00010000
+#endif
+#define FAN_INIT_XATTR_FLAGS (FAN_CLASS_PRE_CONTENT | FAN_XATTR_IGNORE_MASK)
+
 #ifndef FAN_MARK_EVICTABLE
 #define FAN_MARK_EVICTABLE 0x00000200
 #endif
 #ifndef FAN_MARK_IGNORE
 #define FAN_MARK_IGNORE 0x00000400
+#endif
+#ifndef FAN_MARK_SYNC
+#define FAN_MARK_SYNC	0x00000800
+#endif
+#ifndef FAN_MARK_XATTR
+#define FAN_MARK_XATTR  0x00001000
 #endif
 #ifndef FAN_MARK_IGNORE_SURV
 #define FAN_MARK_IGNORE_SURV (FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY)
@@ -39,7 +50,7 @@ struct fanotify_response_error {
 };
 #endif
 
-static int ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_EVICTABLE;
+static int ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_XATTR;
 
 static void fanotify_add_data_watch(int fanotify_fd, const char *path, int is_dir)
 {
@@ -332,7 +343,13 @@ int fanotify_main()
 {
 	int fanotify_fd;
 
-	fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDWR | O_LARGEFILE);
+	fanotify_fd = fanotify_init(FAN_INIT_XATTR_FLAGS, O_RDWR | O_LARGEFILE);
+	if (fanotify_fd < 0) {
+		/* Persistent marks not supported - fallback to evictable marks */
+		ignore_mark_flags = FAN_MARK_IGNORE_SURV | FAN_MARK_EVICTABLE;
+		fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT,
+					    O_RDWR | O_LARGEFILE);
+	}
 	if (fanotify_fd < 0)
 		exit_perror("fanotify_init");
 
