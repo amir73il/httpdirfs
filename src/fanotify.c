@@ -9,12 +9,21 @@
 #include <sys/stat.h>
 #include <sys/fanotify.h>
 
+#ifndef FAN_CLASS_VFS_FILTER
+#define FAN_CLASS_VFS_FILTER 0x0000000c
+#endif
+
 #ifndef FAN_LOOKUP_PERM
 #define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
 #endif
 
+#ifndef FAN_PRE_VFS
+#define FAN_PRE_VFS	0x80000000 /* Pre-vfs filter hook */
+#endif
+
+
 #define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
-#define FAN_EVENTS	(FAN_PRE_ACCESS)
+#define FAN_EVENTS	(FAN_PRE_ACCESS | FAN_PRE_VFS)
 
 static void fanotify_add_data_watch(int fanotify_fd, const char *path)
 {
@@ -191,7 +200,7 @@ static void handle_events(int fanotify_fd)
 			exit_perror("fstat");
 
 		ret = -EPERM;
-		if (metadata->mask & FAN_PRE_ACCESS) {
+		if (metadata->mask & FAN_PRE_ACCESS && metadata->mask & FAN_PRE_VFS) {
 			ret = handle_access_event(fanotify_fd, metadata, relpath, &st);
 		}
 
@@ -210,7 +219,7 @@ int fanotify_main()
 {
 	int fanotify_fd;
 
-	fanotify_fd = fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDWR | O_LARGEFILE);
+	fanotify_fd = fanotify_init(FAN_CLASS_VFS_FILTER, O_RDWR | O_LARGEFILE);
 	if (fanotify_fd < 0)
 		exit_perror("fanotify_init");
 
