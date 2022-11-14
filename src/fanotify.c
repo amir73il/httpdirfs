@@ -47,12 +47,19 @@
 #define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
 #endif
 
+#ifndef FAN_PRE_MODIFY
+#define FAN_PRE_MODIFY	0x00100000 /* Pre data modify */
+#endif
+#ifndef FAN_PRE_ATTRIB
+#define FAN_PRE_ATTRIB	0x00200000 /* Pre metadata change */
+#endif
+
 #ifndef FAN_PRE_VFS
 #define FAN_PRE_VFS	0x80000000 /* Pre-vfs filter hook */
 #endif
 
 
-#define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
+#define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM | FAN_PRE_MODIFY)
 #define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_VFS)
 
 #ifndef FAN_EVENT_INFO_TYPE_RANGE
@@ -218,6 +225,10 @@ static int handle_access_event(struct fanotify_group *fanotify,
 		default:
 			ret = -EPERM;
 	}
+
+	/* Deny modify content and truncate if cache is not fully populated */
+	if (ret > 0 && event->mask & FAN_PRE_MODIFY)
+		ret = -EROFS;
 
 	return ret;
 }
