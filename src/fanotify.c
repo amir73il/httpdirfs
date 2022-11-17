@@ -56,6 +56,7 @@
 #ifndef FAN_PRE_ATTRIB
 #define FAN_PRE_ATTRIB	0x00200000 /* Pre metadata change */
 #endif
+#define FAN_PRE_DIRENT	0x03c00000 /* Pre create/delete/move */
 
 #ifndef FAN_PRE_VFS
 #define FAN_PRE_VFS	0x80000000 /* Pre-vfs filter hook */
@@ -63,7 +64,9 @@
 
 
 #define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM | FAN_PRE_MODIFY)
-#define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_VFS)
+#define FAN_PRE_CHANGE	(FAN_PRE_ATTRIB | FAN_PRE_MODIFY)
+#define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_CHANGE | \
+			 FAN_PRE_DIRENT | FAN_PRE_VFS)
 
 #ifndef FAN_EVENT_INFO_TYPE_RANGE
 #define FAN_EVENT_INFO_TYPE_RANGE 6
@@ -88,6 +91,8 @@ struct fanotify_response_error {
 
 struct fanotify_group {
 	int fd;
+	uint64_t mask;
+	const char *name;
 	int ignore_mark_flags;
 };
 
@@ -106,7 +111,7 @@ static int fanotify_reset_data_watch(struct fanotify_group *fanotify,
 		return -1;
 	}
 
-	lprintf(info, "Reset data watch on '%s'\n", path);
+	lprintf(info, "Reset access watch on '%s'\n", path);
 	return 0;
 }
 
@@ -125,16 +130,16 @@ static int fanotify_add_data_watch(struct fanotify_group *fanotify,
 		return -1;
 	}
 
-	lprintf(info, "Added data watch on '%s'\n", path);
+	lprintf(info, "Added access watch on '%s'\n", path);
 	return 0;
 }
 
 static void fanotify_remove_data_watch(struct fanotify_group *fanotify,
 				       const char *path, int is_dir)
 {
-	/* Add inode mark with ignore mask to stop getting access events */
+	/* Add inode mark with ignore mask to stop getting access/change events */
 	int flags = FAN_MARK_ADD | fanotify->ignore_mark_flags;
-	uint64_t mask = FAN_PRE_ACCESS | (is_dir ? FAN_ONDIR : 0);
+	uint64_t mask = fanotify->mask | (is_dir ? FAN_ONDIR : 0);
 
 	if (fanotify_mark(fanotify->fd, flags, mask,
 			  DATA_DIR_fd, path)) {
@@ -143,7 +148,7 @@ static void fanotify_remove_data_watch(struct fanotify_group *fanotify,
 		return;
 	}
 
-	lprintf(info, "Removed data watch on '%s'\n", path);
+	lprintf(info, "Removed %s watch on '%s'\n", fanotify->name, path);
 }
 
 static void fanotify_add_root_watch(struct fanotify_group *fanotify,
@@ -153,8 +158,15 @@ static void fanotify_add_root_watch(struct fanotify_group *fanotify,
 	fanotify_add_data_watch(fanotify, ".", 1);
 
 	if (fanotify_mark(fanotify->fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-			  FAN_EVENTS | FAN_ONDIR, AT_FDCWD, path))
-		exit_perror("add data dir root mark");
+			  FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_VFS | FAN_ONDIR,
+			  AT_FDCWD, path))
+		exit_perror("add data access root mark");
+
+	fanotify++;
+	if (fanotify_mark(fanotify->fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+			  FAN_PRE_CHANGE | FAN_PRE_DIRENT | FAN_PRE_VFS | FAN_ONDIR,
+			  AT_FDCWD, path))
+		exit_perror("add change tracking root mark");
 
 	lprintf(info, "Added mount watch on '%s'\n", path);
 }
@@ -259,6 +271,12 @@ static int handle_access_event(struct fanotify_group *fanotify,
 {
 	int ret;
 
+	if (!(event->mask & FAN_PRE_VFS)) {
+		/* Writing to cache is not allowed */
+		/* TODO: read-only check if cache is already populated */
+		return -EPERM;
+	}
+
 	switch (st->st_mode & S_IFMT) {
 		case S_IFDIR:
 			/* Allow dir to be accessed if all cache entries are created */
@@ -279,6 +297,20 @@ static int handle_access_event(struct fanotify_group *fanotify,
 		ret = -EROFS;
 
 	return ret;
+}
+
+/*
+ * Return values:
+ * <0 to deny change and return error
+ * >0 allow change but keep watching
+ *  0 allow change and stop watching
+ */
+static int handle_change_event(struct fanotify_group *fanotify,
+			       const struct fanotify_event_metadata *event,
+			       const char *relpath, struct stat *st)
+{
+	/* Deny change if change is not recorded */
+	return -EROFS;
 }
 
 static void handle_events(struct fanotify_group *fanotify)
@@ -348,9 +380,13 @@ static void handle_events(struct fanotify_group *fanotify)
 			metadata->mask, abspath, relpath, count, offset);
 
 		ret = -EPERM;
-		if (metadata->mask & FAN_PRE_ACCESS && metadata->mask & FAN_PRE_VFS) {
+		if (!(fanotify->mask & metadata->mask)) {
+			/* Deny FAN_PRE_DIRENT and open of file during eviction */
+		} else if (fanotify->mask == FAN_PRE_ACCESS) {
 			ret = handle_access_event(fanotify, metadata, relpath, &st,
 						  offset, count);
+		} else if (fanotify->mask == FAN_PRE_CHANGE) {
+			ret = handle_change_event(fanotify, metadata, relpath, &st);
 		}
 
 		response.fd = metadata->fd;
@@ -571,8 +607,8 @@ void handle_command(struct fanotify_group *fanotify)
 	lprintf(warning, "Unknown command: %s", line);
 }
 
-static int fanotify_init_group(struct fanotify_group *fanotify,
-				int init_flags, int mark_flags)
+static int fanotify_init_group(struct fanotify_group *fanotify, const char *name,
+				int init_flags, int mark_flags, uint64_t mask)
 {
 	int fd = fanotify_init(init_flags, O_RDWR | O_LARGEFILE);
 
@@ -580,30 +616,43 @@ static int fanotify_init_group(struct fanotify_group *fanotify,
 		return fd;
 
 	fanotify->fd = fd;
+	fanotify->name = name;
+	fanotify->mask = mask;
 	fanotify->ignore_mark_flags = FAN_MARK_IGNORE_SURV | mark_flags;
 	return 0;
 }
 
 int fanotify_main()
 {
-	struct fanotify_group fanotify;
+	struct fanotify_group fanotify[2];
 	pthread_t access_monitor;
+	pthread_t change_monitor;
 
 	/* If persistent xattr marks not supported - fallback to evictable marks */
-	if (fanotify_init_group(&fanotify, FAN_INIT_XATTR_FLAGS, FAN_MARK_XATTR) &&
-	    fanotify_init_group(&fanotify, FAN_INIT_FLAGS, FAN_MARK_EVICTABLE))
-		exit_perror("init fanotify group");
+	if (fanotify_init_group(fanotify, "access", FAN_INIT_XATTR_FLAGS,
+				FAN_MARK_XATTR, FAN_PRE_ACCESS) &&
+	    fanotify_init_group(fanotify, "access", FAN_INIT_FLAGS,
+				FAN_MARK_EVICTABLE, FAN_PRE_ACCESS))
+		exit_perror("init fanotify (data access) group");
+
+	if (fanotify_init_group(fanotify + 1, "change", FAN_INIT_FLAGS,
+				FAN_MARK_EVICTABLE, FAN_PRE_CHANGE))
+		exit_perror("init fanotify (change tracking) group");
 
 	/* Watch events on data or mount dir */
-	fanotify_watch_data_dir(&fanotify);
+	fanotify_watch_data_dir(fanotify);
 
-	if (pthread_create(&access_monitor, NULL, events_loop, (void*)&fanotify))
+	if (pthread_create(&access_monitor, NULL, events_loop, (void*)fanotify))
 		exit_perror("start access monitor thread");
+	if (pthread_create(&change_monitor, NULL, events_loop, (void*)(fanotify + 1)))
+		exit_perror("start change monitor thread");
 
 	for (;;)
-		handle_command(&fanotify);
+		handle_command(fanotify);
 
 	pthread_join(access_monitor, NULL);
-	close(fanotify.fd);
+	pthread_join(change_monitor, NULL);
+	close(fanotify[0].fd);
+	close(fanotify[1].fd);
 	return 0;
 }
