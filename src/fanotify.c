@@ -15,6 +15,16 @@
 #define FAN_CLASS_VFS_FILTER 0x0000000c
 #endif
 
+#ifndef FAN_MARK_EVICTABLE
+#define FAN_MARK_EVICTABLE 0x00000200
+#endif
+#ifndef FAN_MARK_IGNORE
+#define FAN_MARK_IGNORE 0x00000400
+#endif
+#ifndef FAN_MARK_IGNORE_SURV
+#define FAN_MARK_IGNORE_SURV (FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY)
+#endif
+
 #ifndef FAN_LOOKUP_PERM
 #define FAN_LOOKUP_PERM	0x00080000 /* Path lookup hook */
 #endif
@@ -25,7 +35,7 @@
 
 
 #define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
-#define FAN_EVENTS	(FAN_PRE_ACCESS | FAN_PRE_VFS)
+#define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_VFS)
 
 #ifndef FAN_ERRNO
 #define FAN_ERRNO	0x03
@@ -38,31 +48,59 @@ struct fanotify_response_error {
 };
 #endif
 
-static void fanotify_add_data_watch(int fanotify_fd, const char *path)
+struct fanotify_group {
+	int fd;
+	int ignore_mark_flags;
+};
+
+static void fanotify_add_data_watch(struct fanotify_group *fanotify,
+				    const char *path, int is_dir)
 {
-	if (fanotify_mark(fanotify_fd, FAN_MARK_ADD, FAN_EVENTS | FAN_ONDIR,
+	/* Add inode mark with ignore mask to stop getting open events */
+	int flags = FAN_MARK_ADD | fanotify->ignore_mark_flags;
+	uint64_t mask = FAN_OPEN_PERM | (is_dir ? FAN_ONDIR : 0);
+
+	if (fanotify_mark(fanotify->fd, flags, mask,
 			  DATA_DIR_fd, path)) {
 		lprintf(warning, "Failed adding watch on '%s' (%s)\n",
 			path, strerror(errno));
 		return;
 	}
 
-	lprintf(info, "Added watch on '%s'\n", path);
+	lprintf(info, "Added data watch on '%s'\n", path);
 }
 
-static void fanotify_remove_data_watch(int fanotify_fd, const char *path)
+static void fanotify_remove_data_watch(struct fanotify_group *fanotify,
+				       const char *path, int is_dir)
 {
-	if (fanotify_mark(fanotify_fd, FAN_MARK_REMOVE, FAN_EVENTS | FAN_ONDIR,
+	/* Add inode mark with ignore mask to stop getting access events */
+	int flags = FAN_MARK_ADD | fanotify->ignore_mark_flags;
+	uint64_t mask = FAN_PRE_ACCESS | (is_dir ? FAN_ONDIR : 0);
+
+	if (fanotify_mark(fanotify->fd, flags, mask,
 			  DATA_DIR_fd, path)) {
 		lprintf(warning, "Failed removing watch on '%s' (%s)\n",
 			path, strerror(errno));
 		return;
 	}
 
-	lprintf(info, "Removed watch on '%s'\n", path);
+	lprintf(info, "Removed data watch on '%s'\n", path);
 }
 
-static int fs_readdir(int fanotify_fd, const char *path)
+static void fanotify_add_root_watch(struct fanotify_group *fanotify,
+				    const char *path)
+{
+	/* Ignore open of data root dir before denying all opens on mount/fs */
+	fanotify_add_data_watch(fanotify, ".", 1);
+
+	if (fanotify_mark(fanotify->fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+			  FAN_EVENTS | FAN_ONDIR, AT_FDCWD, path))
+		exit_perror("add data dir root mark");
+
+	lprintf(info, "Added mount watch on '%s'\n", path);
+}
+
+static int fs_readdir(struct fanotify_group *fanotify, const char *path)
 {
 	size_t pathlen = strlen(path);
 	char childpath[PATH_MAX];
@@ -98,7 +136,8 @@ static int fs_readdir(int fanotify_fd, const char *path)
 			default:
 				continue;
 		}
-		fanotify_add_data_watch(fanotify_fd, childpath);
+		/* Allow open and watch for data access */
+		fanotify_add_data_watch(fanotify, childpath, link->type == LINK_DIR);
 	}
 
 	return 0;
@@ -130,7 +169,7 @@ static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
  * >0 allow access but keep watching
  *  0 allow access and stop watching
  */
-static int handle_access_event(int fanotify_fd,
+static int handle_access_event(struct fanotify_group *fanotify,
 			       const struct fanotify_event_metadata *event,
 			       const char *relpath, struct stat *st)
 {
@@ -141,7 +180,7 @@ static int handle_access_event(int fanotify_fd,
 		case S_IFDIR:
 			/* Allow dir to be accessed if all cache entries are created */
 			/* TODO: populate a single child entry on FAN_LOOKUP_PERM event */
-			ret = fs_readdir(fanotify_fd, relpath);
+			ret = fs_readdir(fanotify, relpath);
 			break;
 		case S_IFREG:
 			/* Allow file to be accessed if all the file data is downloaded
@@ -161,7 +200,7 @@ static int handle_access_event(int fanotify_fd,
 	return ret;
 }
 
-static void handle_events(int fanotify_fd)
+static void handle_events(struct fanotify_group *fanotify)
 {
 	const struct fanotify_event_metadata *metadata;
 	struct fanotify_event_metadata buf[200];
@@ -173,7 +212,7 @@ static void handle_events(int fanotify_fd)
 	struct fanotify_response_error response;
 	int ret;
 
-	len = read(fanotify_fd, (void *) &buf, sizeof(buf));
+	len = read(fanotify->fd, (void *) &buf, sizeof(buf));
 	if (len <= 0 && errno != EINTR)
 		exit_perror("read");
 
@@ -212,7 +251,7 @@ static void handle_events(int fanotify_fd)
 
 		ret = -EPERM;
 		if (metadata->mask & FAN_PRE_ACCESS && metadata->mask & FAN_PRE_VFS) {
-			ret = handle_access_event(fanotify_fd, metadata, relpath, &st);
+			ret = handle_access_event(fanotify, metadata, relpath, &st);
 		}
 
 		response.fd = metadata->fd;
@@ -223,10 +262,11 @@ static void handle_events(int fanotify_fd)
 			response.response = FAN_ALLOW;
 			response.error = 0;
 		}
-		write(fanotify_fd, &response, sizeof(struct fanotify_response));
-		if (!ret)
-			fanotify_remove_data_watch(fanotify_fd, relpath);
-
+		write(fanotify->fd, &response, sizeof(struct fanotify_response));
+		if (!ret) {
+			fanotify_remove_data_watch(fanotify, relpath,
+						   st.st_mode & S_IFDIR);
+		}
 		close(metadata->fd);
 		metadata = FAN_EVENT_NEXT(metadata, len);
 	}
@@ -268,7 +308,7 @@ static void set_signal_handler(int sig, void (*handler)(int))
 		exit_perror("sigaction");
 }
 
-void fanotify_watch_data_dir(int fanotify_fd)
+void fanotify_watch_data_dir(struct fanotify_group *fanotify)
 {
 	set_signal_handler(SIGINT, fanotify_cleanup);
 	set_signal_handler(SIGTERM, fanotify_cleanup);
@@ -295,30 +335,42 @@ void fanotify_watch_data_dir(int fanotify_fd)
 		exit_perror("bind mount data dir");
 	}
 
+	/* Hook on any access to bind mount before moving into place */
+	fanotify_add_root_watch(fanotify, DATA_DIR);
+
 	if (CONFIG.mount_dir &&
 	    mount(DATA_DIR, CONFIG.mount_dir, NULL, MS_MOVE, NULL)) {
 		fanotify_mount_cleanup();
 		exit_perror("move mount data dir");
 	}
+}
 
-	/* Hook on first access to data root dir */
-	fanotify_add_data_watch(fanotify_fd, ".");
+static int fanotify_init_group(struct fanotify_group *fanotify,
+				int init_flags, int mark_flags)
+{
+	int fd = fanotify_init(init_flags, O_RDWR | O_LARGEFILE);
+
+	if (fd < 0)
+		return fd;
+
+	fanotify->fd = fd;
+	fanotify->ignore_mark_flags = FAN_MARK_IGNORE_SURV | mark_flags;
+	return 0;
 }
 
 int fanotify_main()
 {
-	int fanotify_fd;
+	struct fanotify_group fanotify;
 
-	fanotify_fd = fanotify_init(FAN_CLASS_VFS_FILTER, O_RDWR | O_LARGEFILE);
-	if (fanotify_fd < 0)
-		exit_perror("fanotify_init");
+	if (fanotify_init_group(&fanotify, FAN_CLASS_VFS_FILTER, FAN_MARK_EVICTABLE))
+		exit_perror("init fanotify group");
 
 	/* Watch events on data or mount dir */
-	fanotify_watch_data_dir(fanotify_fd);
+	fanotify_watch_data_dir(&fanotify);
 
 	for (;;)
-		handle_events(fanotify_fd);
+		handle_events(&fanotify);
 
-	close(fanotify_fd);
+	close(fanotify.fd);
 	return 0;
 }
