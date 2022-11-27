@@ -17,11 +17,14 @@
 #ifndef FAN_XATTR_IGNORE_MASK
 #define FAN_XATTR_IGNORE_MASK 0x10000000
 #endif
+#ifndef FAN_REPORT_ACCESS_RANGE
+#define FAN_REPORT_ACCESS_RANGE 0x00002000
+#endif
 #ifndef FAN_XATTR_IGNORE_MASK
 #define FAN_XATTR_IGNORE_MASK 0x10000000
 #endif
 
-#define FAN_INIT_FLAGS (FAN_CLASS_VFS_FILTER)
+#define FAN_INIT_FLAGS (FAN_CLASS_VFS_FILTER | FAN_REPORT_ACCESS_RANGE)
 #define FAN_INIT_XATTR_FLAGS (FAN_INIT_FLAGS | FAN_XATTR_IGNORE_MASK)
 
 #ifndef FAN_MARK_EVICTABLE
@@ -51,6 +54,16 @@
 
 #define FAN_PRE_ACCESS	(FAN_ACCESS_PERM | FAN_LOOKUP_PERM)
 #define FAN_EVENTS	(FAN_OPEN_PERM | FAN_PRE_ACCESS | FAN_PRE_VFS)
+
+#ifndef FAN_EVENT_INFO_TYPE_RANGE
+#define FAN_EVENT_INFO_TYPE_RANGE 6
+
+struct fanotify_event_info_range {
+	struct fanotify_event_info_header hdr;
+	__u32 count;
+	__u64 offset;
+};
+#endif
 
 #ifndef FAN_ERRNO
 #define FAN_ERRNO	0x03
@@ -186,9 +199,9 @@ static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
  */
 static int handle_access_event(struct fanotify_group *fanotify,
 			       const struct fanotify_event_metadata *event,
-			       const char *relpath, struct stat *st)
+			       const char *relpath, struct stat *st,
+			       off_t offset, size_t size)
 {
-	off_t offset;
 	int ret;
 
 	switch (st->st_mode & S_IFMT) {
@@ -198,15 +211,9 @@ static int handle_access_event(struct fanotify_group *fanotify,
 			ret = fs_readdir(fanotify, relpath);
 			break;
 		case S_IFREG:
-			/* Allow file to be accessed if all the file data is downloaded
-			 * or if any block was downloaded, so reading the file sequetially
-			 * to a read buffer smaller than download block size will work.
-			 * TODO: download requested if we can get it from FAN_ACCESS_PERM event */
-			offset = lseek(event->fd, 0, SEEK_HOLE);
-			if (offset < 0)
-				ret = -errno;
-			else
-				ret = fs_read(relpath, event->fd, st->st_size, 1);
+			/* Allow file to be accessed if the requested range was downloaded */
+			/* Request at least 1 byte, so return 0 will mean fully downloaded */
+			ret = fs_read(relpath, event->fd, offset, size ?: 1);
 			break;
 		default:
 			ret = -EPERM;
@@ -219,6 +226,8 @@ static void handle_events(struct fanotify_group *fanotify)
 {
 	const struct fanotify_event_metadata *metadata;
 	struct fanotify_event_metadata buf[200];
+	off_t offset;
+	size_t count;
 	ssize_t len;
 	char abspath[PATH_MAX];
 	const char *relpath;
@@ -257,16 +266,32 @@ static void handle_events(struct fanotify_group *fanotify)
 		if (!*relpath)
 			relpath = ".";
 
-		lprintf(debug, "Got event 0x%08x on '%s' (%s)\n",
-			metadata->mask, abspath, relpath);
-
 		struct stat st;
 		if (fstat(metadata->fd, &st))
 			exit_perror("fstat");
 
+		/*
+		 * If no range in event, setting offset to EOF will check if
+		 * file is fully downloaded.
+		 */
+		offset = st.st_size;
+		count = 0;
+		if (metadata->event_len > FAN_EVENT_METADATA_LEN) {
+			const struct fanotify_event_info_range *range;
+			range = (const struct fanotify_event_info_range *)(metadata + 1);
+			if (range->hdr.info_type == FAN_EVENT_INFO_TYPE_RANGE) {
+				count = range->count;
+				offset = range->offset;
+			}
+		}
+
+		lprintf(debug, "Got event 0x%08x on '%s' (%s) [%d@%llu]\n",
+			metadata->mask, abspath, relpath, count, offset);
+
 		ret = -EPERM;
 		if (metadata->mask & FAN_PRE_ACCESS && metadata->mask & FAN_PRE_VFS) {
-			ret = handle_access_event(fanotify, metadata, relpath, &st);
+			ret = handle_access_event(fanotify, metadata, relpath, &st,
+						  offset, count);
 		}
 
 		response.fd = metadata->fd;
