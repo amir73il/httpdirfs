@@ -5,8 +5,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/fanotify.h>
@@ -348,6 +350,14 @@ static void handle_events(struct fanotify_group *fanotify)
 	}
 }
 
+static void *events_loop(void *group)
+{
+	for (;;)
+		handle_events(group);
+
+	return NULL;
+}
+
 static int fanotify_bind_mounted;
 
 static void fanotify_mount_cleanup()
@@ -368,7 +378,10 @@ static void fanotify_cleanup(int sig)
 	if (fanotify_bind_mounted)
 		fanotify_mount_cleanup();
 
-	exit_error("Terminated by signal");
+	if (sig)
+		exit_error("Terminated by signal");
+	else
+		exit_error("Quit by user");
 }
 
 static void set_signal_handler(int sig, void (*handler)(int))
@@ -421,6 +434,32 @@ void fanotify_watch_data_dir(struct fanotify_group *fanotify)
 	}
 }
 
+/********************************************/
+/* Console commands                         */
+/********************************************/
+
+void handle_command(struct fanotify_group *fanotify)
+{
+	static char *line = NULL;
+	static size_t len = 0;
+	ssize_t nread;
+
+	nread = getline(&line, &len, stdin);
+	if (nread <= 0)
+		exit_perror("getline");
+	line[nread - 1] = 0;
+
+	switch (*line) {
+		case '\0':
+			return;
+		case 'q':
+			fanotify_cleanup(0);
+			break;
+	}
+
+	lprintf(warning, "Unknown command: %s", line);
+}
+
 static int fanotify_init_group(struct fanotify_group *fanotify,
 				int init_flags, int mark_flags)
 {
@@ -437,6 +476,7 @@ static int fanotify_init_group(struct fanotify_group *fanotify,
 int fanotify_main()
 {
 	struct fanotify_group fanotify;
+	pthread_t access_monitor;
 
 	/* If persistent xattr marks not supported - fallback to evictable marks */
 	if (fanotify_init_group(&fanotify, FAN_INIT_XATTR_FLAGS, FAN_MARK_XATTR) &&
@@ -446,9 +486,13 @@ int fanotify_main()
 	/* Watch events on data or mount dir */
 	fanotify_watch_data_dir(&fanotify);
 
-	for (;;)
-		handle_events(&fanotify);
+	if (pthread_create(&access_monitor, NULL, events_loop, (void*)&fanotify))
+		exit_perror("start access monitor thread");
 
+	for (;;)
+		handle_command(&fanotify);
+
+	pthread_join(access_monitor, NULL);
 	close(fanotify.fd);
 	return 0;
 }
