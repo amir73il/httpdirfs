@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/fanotify.h>
 
@@ -90,8 +91,28 @@ struct fanotify_group {
 	int ignore_mark_flags;
 };
 
+/* After this call, future open syscalls are denied by the mark mount */
+static int fanotify_reset_data_watch(struct fanotify_group *fanotify,
+				     const char *path)
+{
+	/* Remove inode mark with ignore mask to start getting open/access events */
+	int flags = FAN_MARK_REMOVE | fanotify->ignore_mark_flags;
+	uint64_t mask = FAN_OPEN_PERM | FAN_PRE_ACCESS;
+
+	if (fanotify_mark(fanotify->fd, flags, mask,
+			  DATA_DIR_fd, path) && errno != ENOENT) {
+		lprintf(warning, "Failed reseting watch on '%s' (%s)\n",
+			path, strerror(errno));
+		return -1;
+	}
+
+	lprintf(info, "Reset data watch on '%s'\n", path);
+	return 0;
+}
+
+/* After this call, future open syscalls are allowed */
 static int fanotify_add_data_watch(struct fanotify_group *fanotify,
-				    const char *path, int is_dir)
+				   const char *path, int is_dir)
 {
 	/* Add inode mark with ignore mask to stop getting open events */
 	int flags = FAN_MARK_ADD | fanotify->ignore_mark_flags;
@@ -359,6 +380,13 @@ static void *events_loop(void *group)
 }
 
 static int fanotify_bind_mounted;
+static struct fanotify_group *fanotify_evict_group;
+static const char *fanotify_evict_path;
+
+static void fanotify_evict_cleanup(struct fanotify_group *fanotify, const char *path)
+{
+	fanotify_add_data_watch(fanotify, path, 0);
+}
 
 static void fanotify_mount_cleanup()
 {
@@ -371,6 +399,11 @@ static void fanotify_mount_cleanup()
 static void fanotify_cleanup(int sig)
 {
 	(void) sig;	/* unused */
+
+	if (fanotify_evict_path) {
+		fanotify_evict_cleanup(fanotify_evict_group, fanotify_evict_path);
+		exit_error("Evict file aborted by signal");
+	}
 
 	if (DATA_DIR_fd > 0)
 		close(DATA_DIR_fd);
@@ -438,6 +471,78 @@ void fanotify_watch_data_dir(struct fanotify_group *fanotify)
 /* Console commands                         */
 /********************************************/
 
+/*
+ * Command to evict a file's cache
+ */
+static int evict_file(struct fanotify_group *fanotify, const char *path)
+{
+	const char *relpath = Data_relpath(AT_FDCWD, path);
+	int ret = -1;
+
+	if (!relpath) {
+		lprintf(error, "Path '%s' is not cached\n", path);
+		return -1;
+	}
+
+	/* Recover after aborted evict */
+	fanotify_evict_cleanup(fanotify, relpath);
+
+	/*
+	 * Run in a forked process so evict can be aborted by lease breakers
+	 */
+	pid_t pid = fork();
+	if (pid > 0)
+		return wait(NULL) >= 0;
+	else if (pid < 0)
+		exit_perror("fork");
+
+	fanotify_evict_group = fanotify;
+	fanotify_evict_path = relpath;
+	set_signal_handler(SIGIO, fanotify_cleanup);
+
+	int fd = openat(DATA_DIR_fd, relpath, O_RDWR | O_NONBLOCK);
+	if (fd < 0)
+		exit_perror(path);
+
+	struct stat st;
+	if (fstat(fd, &st))
+		exit_perror("fstat");
+
+	if (!(st.st_mode & S_IFREG))
+		exit_error("Only regular file cache can be evicted.");
+
+	/*
+	 * Acquire write lease to make sure no open fds.
+	 */
+	if (fcntl(fd, F_SETLEASE, F_WRLCK))
+		exit_error("File is open and cannot be evicted.");
+
+	if (fanotify_reset_data_watch(fanotify, relpath))
+		exit_error("Failed denying opens.");
+
+	lprintf(info, "Starting file '%s' cache eviction.\n", path);
+
+	/*
+	 * Now fanotify HSM will deny new opens.
+	 * Reacquire write lease to make sure no opens in progress.
+	 */
+	if (fcntl(fd, F_SETLEASE, F_UNLCK) || fcntl(fd, F_SETLEASE, F_WRLCK)) {
+		lprintf(warning, "File '%s' is open - cache eviction aborted!\n",
+			path);
+		goto out;
+	}
+
+	/* Reset cache entry by removing meta file and punching data file */
+	Cache_delete(relpath, fd);
+
+	lprintf(info, "File '%s' cache was evicted!\n", path);
+	ret = 0;
+out:
+	fanotify_evict_cleanup(fanotify, relpath);
+	close(fd);
+	exit(ret);
+}
+
 void handle_command(struct fanotify_group *fanotify)
 {
 	static char *line = NULL;
@@ -454,6 +559,12 @@ void handle_command(struct fanotify_group *fanotify)
 			return;
 		case 'q':
 			fanotify_cleanup(0);
+			break;
+		case 'e':
+			if (nread > 7 && !strncmp(line, "evict ", 6)) {
+				evict_file(fanotify, line + 6);
+				return;
+			}
 			break;
 	}
 
