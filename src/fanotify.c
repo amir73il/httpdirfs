@@ -88,7 +88,7 @@ struct fanotify_group {
 	int ignore_mark_flags;
 };
 
-static void fanotify_add_data_watch(struct fanotify_group *fanotify,
+static int fanotify_add_data_watch(struct fanotify_group *fanotify,
 				    const char *path, int is_dir)
 {
 	/* Add inode mark with ignore mask to stop getting open events */
@@ -99,10 +99,11 @@ static void fanotify_add_data_watch(struct fanotify_group *fanotify,
 			  DATA_DIR_fd, path)) {
 		lprintf(warning, "Failed adding watch on '%s' (%s)\n",
 			path, strerror(errno));
-		return;
+		return -1;
 	}
 
 	lprintf(info, "Added data watch on '%s'\n", path);
+	return 0;
 }
 
 static void fanotify_remove_data_watch(struct fanotify_group *fanotify,
@@ -135,11 +136,25 @@ static void fanotify_add_root_watch(struct fanotify_group *fanotify,
 	lprintf(info, "Added mount watch on '%s'\n", path);
 }
 
+static int fs_init_cache(struct fanotify_group *fanotify, const char *path,
+			 int is_dir)
+{
+	int ret;
+
+	ret = is_dir ? CacheDir_create(path) : Cache_create(path, 0);
+	if (ret < 0)
+		return ret;
+
+	/* Allow open and watch for data access */
+	return fanotify_add_data_watch(fanotify, path, is_dir);
+}
+
 static int fs_readdir(struct fanotify_group *fanotify, const char *path)
 {
 	size_t pathlen = strlen(path);
 	char childpath[PATH_MAX];
 	LinkTable *linktbl;
+	int ret = 0;
 
 	if (!pathlen)
 		return -EINVAL;
@@ -162,20 +177,19 @@ static int fs_readdir(struct fanotify_group *fanotify, const char *path)
 		switch (link->type) {
 			case LINK_DIR:
 				sprintf(childpath + pathlen, "%s/", link->linkname);
-				CacheDir_create(childpath);
 				break;
 			case LINK_FILE:
 				sprintf(childpath + pathlen, "%s", link->linkname);
-				Cache_create(childpath);
 				break;
 			default:
 				continue;
 		}
-		/* Allow open and watch for data access */
-		fanotify_add_data_watch(fanotify, childpath, link->type == LINK_DIR);
+		ret = fs_init_cache(fanotify, childpath, link->type == LINK_DIR);
+		if (ret)
+			break;
 	}
 
-	return 0;
+	return ret;
 }
 
 static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
@@ -187,8 +201,19 @@ static int fs_read(const char *path, int data_fd, off_t offset, size_t size)
 	/* Use the fd provided by fanotify to write to cache data file
 	 * to avoid deadlocks */
 	Cache *cache = Cache_open(path, data_fd);
-	if (!cache)
-		return -ENOENT;
+	if (!cache) {
+		/*
+		 * The link clearly exists, the cache cannot be opened,
+		 * attempt cache reset.
+		 */
+		Cache_create(path, 1);
+		cache = Cache_open(path, data_fd);
+		/*
+		 * The cache definitely cannot be opened for some reason.
+		 */
+		if (!cache)
+			return -ENOENT;
+	}
 
 	/* Read via cache into "/dev/null" to populate cache */
 	long recv = Cache_read(cache, NULL, size, offset);

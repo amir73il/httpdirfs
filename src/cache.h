@@ -118,9 +118,11 @@ void CacheSystem_init(const char *path, int url_supplied);
  * \brief Create directories under the cache directory structure, if they do
  * not already exist
  * \return
- *  -   -1 failed to create metadata directory.
- *  -   -2 failed to create data directory.
- *  -   -3 failed to create both metadata and data directory.
+ *  -   0, if both directories already exist
+ *  -   1, if created metadata directory
+ *  -   2, if created data directory
+ *  -   3, if created both metadata and data directory
+ *  -   -1, otherwise
  * \note Called by LinkTable_new()
  */
 int CacheDir_create(const char *fn);
@@ -140,17 +142,18 @@ void Cache_close(Cache *cf);
 /**
  * \brief create a cache file set if it doesn't exist already
  * \return
- *  -   0, if the cache file already exists, or was created successfully.
+ *  -   0, if the cache file already exists
+ *  -   1, if the cache was created successfully
  *  -   -1, otherwise
  * \note Called by fs_open()
  */
-int Cache_create(const char *path);
+int Cache_create(const char *path, int reset);
 
 /**
  * \brief delete a cache file set
  * \note Called by fs_open()
  */
-void Cache_delete(const char *fn);
+void Cache_delete(const char *fn, int data_fd);
 
 /**
  * \brief Intelligently read from the cache system
