@@ -14,12 +14,27 @@
 #ifndef FAN_CLASS_VFS_FILTER
 #define FAN_CLASS_VFS_FILTER 0x0000000c
 #endif
+#ifndef FAN_XATTR_IGNORE_MASK
+#define FAN_XATTR_IGNORE_MASK 0x10000000
+#endif
+#ifndef FAN_XATTR_IGNORE_MASK
+#define FAN_XATTR_IGNORE_MASK 0x10000000
+#endif
+
+#define FAN_INIT_FLAGS (FAN_CLASS_VFS_FILTER)
+#define FAN_INIT_XATTR_FLAGS (FAN_INIT_FLAGS | FAN_XATTR_IGNORE_MASK)
 
 #ifndef FAN_MARK_EVICTABLE
 #define FAN_MARK_EVICTABLE 0x00000200
 #endif
 #ifndef FAN_MARK_IGNORE
 #define FAN_MARK_IGNORE 0x00000400
+#endif
+#ifndef FAN_MARK_SYNC
+#define FAN_MARK_SYNC	0x00000800
+#endif
+#ifndef FAN_MARK_XATTR
+#define FAN_MARK_XATTR  0x00001000
 #endif
 #ifndef FAN_MARK_IGNORE_SURV
 #define FAN_MARK_IGNORE_SURV (FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY)
@@ -362,7 +377,9 @@ int fanotify_main()
 {
 	struct fanotify_group fanotify;
 
-	if (fanotify_init_group(&fanotify, FAN_CLASS_VFS_FILTER, FAN_MARK_EVICTABLE))
+	/* If persistent xattr marks not supported - fallback to evictable marks */
+	if (fanotify_init_group(&fanotify, FAN_INIT_XATTR_FLAGS, FAN_MARK_XATTR) &&
+	    fanotify_init_group(&fanotify, FAN_INIT_FLAGS, FAN_MARK_EVICTABLE))
 		exit_perror("init fanotify group");
 
 	/* Watch events on data or mount dir */
