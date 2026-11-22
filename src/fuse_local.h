@@ -9,4 +9,7 @@
 /* Initialise fuse */
 int fuse_local_init(int argc, char **argv);
 
+/* Expose the cache data dir at mountpoint and populate it with fanotify */
+int fanotify_main(const char *mountpoint);
+
 #endif

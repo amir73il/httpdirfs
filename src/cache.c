@@ -32,7 +32,7 @@ static pthread_mutex_t cf_lock;
 /**
  * \brief The data directory
  */
-static char *DATA_DIR;
+char *DATA_DIR;
 
 /**
  * \brief Calculate cache system directory path
@@ -328,6 +328,10 @@ static long Data_size(const char *fn)
  */
 static long Data_read(Cache *cf, uint8_t *buf, off_t len, off_t offset)
 {
+    /* Populate only, nothing to read into */
+    if (!buf)
+        return len;
+
     if (len == 0) {
         lprintf(error, "requested to read 0 byte!\n");
         return -EINVAL;
@@ -606,10 +610,21 @@ void Cache_delete(const char *fn)
  *  -   0 on success
  *  -   -1 on failure, with appropriate errno set.
  */
-static int Data_open(Cache *cf)
+static int Data_open(Cache *cf, int data_fd)
 {
     char *datafn = path_append(DATA_DIR, cf->path);
-    cf->dfp = fopen(datafn, "r+");
+    if (data_fd >= 0) {
+        /*
+         * Write the data via the fd provided by fanotify, which does not
+         * generate fanotify events, to avoid deadlocks.
+         */
+        int fd = dup(data_fd);
+        cf->dfp = fd < 0 ? NULL : fdopen(fd, "r+");
+        if (!cf->dfp && fd >= 0)
+            close(fd);
+    } else {
+        cf->dfp = fopen(datafn, "r+");
+    }
     if (!cf->dfp) {
         /*
          * Failed to open the data file
@@ -728,6 +743,11 @@ int Cache_create(const char *path)
 }
 
 Cache *Cache_open(const char *fn)
+{
+    return Cache_open_fd(fn, -1);
+}
+
+Cache *Cache_open_fd(const char *fn, int data_fd)
 {
     /*
      * Obtain the link structure memory pointer
@@ -854,7 +874,7 @@ cf->content_length: %ld, Data_size(fn): %ld.\n", fn, cf->content_length,
         return NULL;
     }
 
-    if (Data_open(cf)) {
+    if (Data_open(cf, data_fd)) {
         Cache_free(cf);
         lprintf(error, "cannot open data file %s.\n", fn);
 
@@ -1082,4 +1102,38 @@ bgdl: {
     }
 
     return send;
+}
+
+long Cache_populate(Cache *cf, off_t offset, off_t len)
+{
+    off_t end;
+
+    if (offset >= cf->content_length)
+        return 0;
+
+    end = len ? offset + len : cf->content_length;
+    if (end > cf->content_length)
+        end = cf->content_length;
+
+    for (off_t seg = offset / cf->blksz * cf->blksz; seg < end;
+         seg += cf->blksz) {
+        if (Seg_exist(cf, seg))
+            continue;
+        /* Download a single segment without background download */
+        if (Cache_read(cf, NULL, 1, seg) < 0)
+            return -EIO;
+        if (!Seg_exist(cf, seg))
+            return -EIO;
+    }
+
+    return end - offset;
+}
+
+int Cache_complete(Cache *cf)
+{
+    for (off_t seg = 0; seg < cf->content_length; seg += cf->blksz) {
+        if (!Seg_exist(cf, seg))
+            return 0;
+    }
+    return 1;
 }

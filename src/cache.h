@@ -82,6 +82,11 @@ extern int CACHE_SYSTEM_INIT;
 extern char *META_DIR;
 
 /**
+ * \brief The data directory
+ */
+extern char *DATA_DIR;
+
+/**
  * \brief initialise the cache system directories
  * \details This function basically sets up the following variables:
  *  - META_DIR
@@ -143,4 +148,23 @@ void Cache_delete(const char *fn);
  */
 long Cache_read(Cache *cf, char *const output_buf, const off_t len,
                 const off_t offset_start);
+
+/**
+ * \brief Open a cache file and use data_fd for access to the data file
+ * \details data_fd is a file descriptor provided by fanotify.
+ */
+Cache *Cache_open_fd(const char *fn, int data_fd);
+
+/**
+ * \brief Download the segments in the range [offset, offset + len)
+ * \details len 0 means up to the end of the file.
+ * \return the length of the populated range, or negative error
+ */
+long Cache_populate(Cache *cf, off_t offset, off_t len);
+
+/**
+ * \brief Check if all the file data was downloaded
+ * \return 1 if complete, 0 otherwise
+ */
+int Cache_complete(Cache *cf);
 #endif

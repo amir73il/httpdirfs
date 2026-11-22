@@ -108,6 +108,9 @@ activate Sonic mode.\n");
         }
     }
 
+    if (CONFIG.fanotify_enabled)
+        return fanotify_main(argv[argc - 1]);
+
 fuse_start:
     fuse_local_init(fuse_argc, fuse_argv);
 
@@ -201,6 +204,7 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
         { "single-file-mode", required_argument, NULL, 'L' },   /* 22 */
         { "cacert", required_argument, NULL, 'L' },     /* 23 */
         { "proxy-cacert", required_argument, NULL, 'L' },       /* 24 */
+        { "fanotify", no_argument, NULL, 'L' },         /* 25 */
         { 0, 0, 0, 0 }
     };
     while ((c =
@@ -304,6 +308,10 @@ parse_arg_list(int argc, char **argv, char ***fuse_argv, int *fuse_argc)
             case 24:
                 CONFIG.proxy_cafile = strdup(optarg);
                 break;
+            case 25:
+                CONFIG.fanotify_enabled = 1;
+                CONFIG.cache_enabled = 1;
+                break;
             default:
                 fprintf(stderr, "see httpdirfs -h for usage\n");
                 return 1;
@@ -380,6 +388,9 @@ HTTPDirFS options:\n\
         --single-file-mode  Single file mode - rather than mounting a whole\n\
                             directory, present a single file inside a virtual\n\
                             directory.\n\
+        --fanotify          fanotify mode - rather than mounting FUSE, bind\n\
+                            mount the cache data dir at the mountpoint and\n\
+                            populate it on access (implies --cache).\n\
 \n\
     For mounting a Airsonic / Subsonic server:\n\
         --sonic-username    The username for your Airsonic / Subsonic server\n\

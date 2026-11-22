@@ -38,6 +38,16 @@ void PTHREAD_MUTEX_UNLOCK(pthread_mutex_t *x);
 void exit_failure(void);
 
 /**
+ * \brief print an error message and exit(EXIT_FAILURE)
+ */
+void exit_error(const char *msg);
+
+/**
+ * \brief print an error message with errno and exit(EXIT_FAILURE)
+ */
+void exit_perror(const char *msg);
+
+/**
  * \brief erase a string from the terminal
  */
 void erase_string(FILE *file, size_t max_len, char *s);

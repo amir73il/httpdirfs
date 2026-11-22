@@ -68,6 +68,8 @@ typedef struct {
     /** \brief Server certificate file */
     char *cafile;
     /*--------------- Cache related ---------------*/
+    /** \brief Whether fanotify mode is enabled */
+    int fanotify_enabled;
     /** \brief Whether cache mode is enabled */
     int cache_enabled;
     /** \brief The cache location*/
