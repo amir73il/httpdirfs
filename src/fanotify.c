@@ -143,14 +143,18 @@ static void fanotify_ignore(int group, int fd, uint64_t mask,
 	}
 }
 
-/* Create the cache entry of link at path, unless it exists and is valid */
-static void fs_create_entry(Link *link, const char *path)
+/*
+ * Create the cache entry of link at path, unless it exists and is valid.
+ * An invalid cache entry is reset.
+ */
+static int fs_create_entry(Link *link, const char *path)
 {
 	Cache *cache;
 
 	switch (link->type) {
 	case LINK_DIR:
-		CacheDir_create(path);
+		if (CacheDir_create(path))
+			return -EIO;
 		break;
 	case LINK_FILE:
 		cache = Cache_open(path);
@@ -158,12 +162,15 @@ static void fs_create_entry(Link *link, const char *path)
 			Cache_close(cache);
 			break;
 		}
-		if (Cache_create(path))
+		if (Cache_create(path)) {
 			lprintf(warning, "Failed to create cache for '%s'\n", path);
+			return -EIO;
+		}
 		break;
 	default:
 		break;
 	}
+	return 0;
 }
 
 /*
@@ -198,7 +205,12 @@ static int fs_readdir(const char *path, const char *name)
 			continue;
 		snprintf(childpath + pathlen, PATH_MAX - pathlen, "%s",
 			 link->linkname);
-		fs_create_entry(link, childpath);
+		/*
+		 * Deny the event if a cache entry cannot be created.  A denied
+		 * event is generated again on the next access, which retries.
+		 */
+		if (fs_create_entry(link, childpath))
+			return -EIO;
 		if (name)
 			break;
 	}

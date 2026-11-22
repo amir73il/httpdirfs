@@ -286,13 +286,28 @@ static void Data_create(Cache *cf)
 
     mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
     char *datafn = path_append(DATA_DIR, cf->path);
-    fd = open(datafn, O_WRONLY | O_CREAT, mode);
+    int reset = 0;
+    fd = open(datafn, O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (fd == -1 && errno == EEXIST) {
+        fd = open(datafn, O_WRONLY, mode);
+        reset = 1;
+    }
     FREE(datafn);
     if (fd == -1) {
         lprintf(fatal, "open(): %s\n", strerror(errno));
     }
     if (ftruncate(fd, cf->content_length)) {
         lprintf(warning, "ftruncate(): %s\n", strerror(errno));
+    }
+    /*
+     * In fanotify mode, reset an existing data file in place: the new
+     * metadata marks no segment downloaded, so punch out the stale data
+     * instead of unlinking the file that users see.
+     */
+    if (reset && CONFIG.fanotify_enabled && cf->content_length &&
+            fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0,
+                      cf->content_length)) {
+        lprintf(warning, "fallocate(): %s\n", strerror(errno));
     }
     if (close(fd)) {
         lprintf(fatal, "close:(): %s\n", strerror(errno));
@@ -452,17 +467,18 @@ int CacheDir_create(const char *dirn)
 {
     char *metadirn = path_append(META_DIR, dirn);
     char *datadirn = path_append(DATA_DIR, dirn);
-    int i;
+    int i = 0;
 
-    i = -mkdir(metadirn, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-    if (i && (errno != EEXIST)) {
+    if (mkdir(metadirn, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) &&
+            errno != EEXIST) {
         lprintf(fatal, "mkdir(): %s\n", strerror(errno));
+        i |= 1;
     }
 
-    i |= -mkdir(datadirn,
-                S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) << 1;
-    if (i && (errno != EEXIST)) {
+    if (mkdir(datadirn, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) &&
+            errno != EEXIST) {
         lprintf(fatal, "mkdir(): %s\n", strerror(errno));
+        i |= 2;
     }
     FREE(datadirn);
     FREE(metadirn);
@@ -556,7 +572,12 @@ static int Cache_exist(const char *fn)
     int no_meta = access(metafn, F_OK);
     int no_data = access(datafn, F_OK);
 
-    if (no_meta ^ no_data) {
+    /*
+     * In fanotify mode, the data file is the file that users see and may
+     * have open, so do not unlink it.  The cache entry is reset in place by
+     * Cache_create().
+     */
+    if ((no_meta ^ no_data) && !CONFIG.fanotify_enabled) {
         if (no_meta) {
             lprintf(warning, "Cache file partially missing.\n");
             if (unlink(datafn)) {

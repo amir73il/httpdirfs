@@ -101,6 +101,7 @@ void CacheSystem_init(const char *path, int url_supplied);
  * \brief Create directories under the cache directory structure, if they do
  * not already exist
  * \return
+ *  -   0 if both directories exist or were created.
  *  -   -1 failed to create metadata directory.
  *  -   -2 failed to create data directory.
  *  -   -3 failed to create both metadata and data directory.
