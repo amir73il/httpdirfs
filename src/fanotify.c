@@ -33,6 +33,16 @@
  * a FAN_CLASS_CONTENT group for directories and a FAN_CLASS_PRE_CONTENT group
  * for files.
  *
+ * With kernel support for FAN_PRE_DIR_ACCESS, a single
+ * FAN_CLASS_PRE_CONTENT_FID group is used instead:
+ * - FAN_PRE_DIR_ACCESS without a name (readdir) creates the cache entries of
+ *   all the directory children.
+ * - FAN_PRE_DIR_ACCESS with a name (lookup) creates the cache entry of a single
+ *   child, so a path can be accessed without readdir of its parents.
+ * - FAN_PRE_ACCESS on a file downloads the accessed range before the access.
+ * An allowed readdir event is not generated again until the directory dentry
+ * is evicted, so directories need no ignore mark.
+ *
  * Fully populated objects get an evictable ignore mark, so they generate no
  * more events until their inode is evicted.
  *
@@ -59,6 +69,23 @@
 #ifndef FAN_EVENT_INFO_TYPE_RANGE
 #define FAN_EVENT_INFO_TYPE_RANGE	6
 #endif
+#ifndef FAN_PRE_DIR_ACCESS
+#define FAN_PRE_DIR_ACCESS	0x00200000
+#endif
+#ifndef FAN_REPORT_DFID_NAME_TARGET
+#define FAN_REPORT_DFID_NAME_TARGET	(0x00000200 | 0x00000400 | \
+					 0x00000800 | 0x00001000)
+#endif
+#ifndef FAN_CLASS_PRE_CONTENT_FID
+#define FAN_CLASS_PRE_CONTENT_FID	(FAN_CLASS_PRE_CONTENT | \
+					 FAN_REPORT_DFID_NAME_TARGET)
+#endif
+#ifndef FAN_EVENT_INFO_TYPE_DFID_NAME
+#define FAN_EVENT_INFO_TYPE_DFID_NAME	2
+#endif
+#ifndef FAN_EVENT_INFO_TYPE_DFID
+#define FAN_EVENT_INFO_TYPE_DFID	3
+#endif
 
 /* struct fanotify_event_info_range (since v6.14), for older headers */
 struct fan_event_info_range {
@@ -70,10 +97,13 @@ struct fan_event_info_range {
 
 #define FAN_DIR_EVENTS	(FAN_ACCESS_PERM | FAN_ONDIR)
 #define FAN_FILE_EVENTS	FAN_PRE_ACCESS
+#define FAN_FID_EVENTS	(FAN_PRE_ACCESS | FAN_PRE_DIR_ACCESS)
 
 /* Group for directory access and group for file content access */
 enum { DIR_GROUP, FILE_GROUP, NR_GROUPS };
 static int fanotify_fds[NR_GROUPS] = { -1, -1 };
+/* Single FAN_CLASS_PRE_CONTENT_FID group in FILE_GROUP slot */
+static int fid_mode;
 static const char *MNT_DIR;
 static size_t MNT_DIR_len;
 static int mounted;
@@ -113,11 +143,34 @@ static void fanotify_ignore(int group, int fd, uint64_t mask,
 	}
 }
 
+/* Create the cache entry of link at path, unless it exists and is valid */
+static void fs_create_entry(Link *link, const char *path)
+{
+	Cache *cache;
+
+	switch (link->type) {
+	case LINK_DIR:
+		CacheDir_create(path);
+		break;
+	case LINK_FILE:
+		cache = Cache_open(path);
+		if (cache) {
+			Cache_close(cache);
+			break;
+		}
+		if (Cache_create(path))
+			lprintf(warning, "Failed to create cache for '%s'\n", path);
+		break;
+	default:
+		break;
+	}
+}
+
 /*
- * Create the cache entries of all the children of the directory at path,
- * unless they already exist and are valid.
+ * Create the cache entries of all the children of the directory at path, or
+ * only the cache entry of the child name, unless they exist and are valid.
  */
-static int fs_readdir(const char *path)
+static int fs_readdir(const char *path, const char *name)
 {
 	char childpath[PATH_MAX];
 	LinkTable *linktbl;
@@ -140,29 +193,17 @@ static int fs_readdir(const char *path)
 	/* We skip the head link */
 	for (int i = 1; i < linktbl->num; i++) {
 		Link *link = linktbl->links[i];
-		Cache *cache;
 
+		if (name && strcmp(link->linkname, name))
+			continue;
 		snprintf(childpath + pathlen, PATH_MAX - pathlen, "%s",
 			 link->linkname);
-		switch (link->type) {
-		case LINK_DIR:
-			CacheDir_create(childpath);
+		fs_create_entry(link, childpath);
+		if (name)
 			break;
-		case LINK_FILE:
-			cache = Cache_open(childpath);
-			if (cache) {
-				Cache_close(cache);
-				break;
-			}
-			if (Cache_create(childpath))
-				lprintf(warning, "Failed to create cache for '%s'\n",
-					childpath);
-			break;
-		default:
-			break;
-		}
 	}
 
+	/* Lookup of a name that does not exist creates nothing */
 	return 0;
 }
 
@@ -216,6 +257,38 @@ event_range(const struct fanotify_event_metadata *event)
 	return NULL;
 }
 
+/*
+ * Return the name of a lookup event, from the dir fid info record, or an
+ * empty string for a readdir event.
+ */
+static const char *event_name(const struct fanotify_event_metadata *event)
+{
+	const char *rec = (const char *)event + event->metadata_len;
+	const char *end = (const char *)event + event->event_len;
+
+	while (rec + sizeof(struct fanotify_event_info_header) <= end) {
+		const struct fanotify_event_info_fid *fid = (const void *)rec;
+		const char *rec_end = rec + fid->hdr.len;
+
+		if (!fid->hdr.len || rec_end > end)
+			break;
+		if (fid->hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME) {
+			const struct file_handle *fh = (const void *)fid->handle;
+			const char *name = (const char *)fh->f_handle +
+					   fh->handle_bytes;
+
+			/* The name is followed by zero padding, if any */
+			if (name >= rec_end || !*name)
+				return "";
+			return name;
+		}
+		if (fid->hdr.info_type == FAN_EVENT_INFO_TYPE_DFID)
+			return "";
+		rec += fid->hdr.len;
+	}
+	return NULL;
+}
+
 /* Return a path relative to the mountpoint, starting with '/' */
 static const char *event_path(int fd, char *buf, size_t size)
 {
@@ -256,10 +329,21 @@ static int handle_event(int group, const struct fanotify_event_metadata *event)
 			return 0;
 		}
 		lprintf(debug, "readdir '%s'\n", path);
-		ret = fs_readdir(path);
+		ret = fs_readdir(path, NULL);
 		if (!ret)
 			fanotify_ignore(group, event->fd, FAN_DIR_EVENTS, path);
 		return ret;
+	}
+
+	if (event->mask & FAN_PRE_DIR_ACCESS) {
+		const char *name = event_name(event);
+
+		if (name && *name) {
+			lprintf(debug, "lookup '%s' in '%s'\n", name, path);
+		} else {
+			lprintf(debug, "readdir '%s'\n", path);
+		}
+		return fs_readdir(path, name && *name ? name : NULL);
 	}
 
 	if (!S_ISREG(st.st_mode))
@@ -327,16 +411,25 @@ int fanotify_main(const char *mountpoint)
 		exit_perror(mountpoint);
 	MNT_DIR_len = strlen(MNT_DIR);
 
-	fanotify_fds[DIR_GROUP] = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC,
-						O_RDONLY | O_LARGEFILE);
-	if (fanotify_fds[DIR_GROUP] < 0)
-		exit_perror("fanotify_init");
-
 	/* File data is written via the fds of pre-content events */
-	fanotify_fds[FILE_GROUP] = fanotify_init(FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC,
+	fanotify_fds[FILE_GROUP] = fanotify_init(FAN_CLASS_PRE_CONTENT_FID |
+						 FAN_CLOEXEC,
 						 O_RDWR | O_LARGEFILE);
-	if (fanotify_fds[FILE_GROUP] < 0)
-		exit_perror("fanotify_init pre-content (kernel >= v6.14 required)");
+	if (fanotify_fds[FILE_GROUP] >= 0) {
+		fid_mode = 1;
+	} else {
+		lprintf(info, "No support for FAN_PRE_DIR_ACCESS, readdir is required before access\n");
+		fanotify_fds[DIR_GROUP] = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC,
+							O_RDONLY | O_LARGEFILE);
+		if (fanotify_fds[DIR_GROUP] < 0)
+			exit_perror("fanotify_init");
+
+		fanotify_fds[FILE_GROUP] = fanotify_init(FAN_CLASS_PRE_CONTENT |
+							 FAN_CLOEXEC,
+							 O_RDWR | O_LARGEFILE);
+		if (fanotify_fds[FILE_GROUP] < 0)
+			exit_perror("fanotify_init pre-content (kernel >= v6.14 required)");
+	}
 
 	set_signal_handler(SIGINT, fanotify_cleanup);
 	set_signal_handler(SIGTERM, fanotify_cleanup);
@@ -345,7 +438,10 @@ int fanotify_main(const char *mountpoint)
 		exit_perror("bind mount cache data dir");
 	mounted = 1;
 
-	if (fanotify_mark(fanotify_fds[FILE_GROUP], FAN_MARK_ADD | FAN_MARK_MOUNT,
+	if (fid_mode ?
+	    fanotify_mark(fanotify_fds[FILE_GROUP], FAN_MARK_ADD | FAN_MARK_MOUNT,
+			  FAN_FID_EVENTS, AT_FDCWD, MNT_DIR) :
+	    fanotify_mark(fanotify_fds[FILE_GROUP], FAN_MARK_ADD | FAN_MARK_MOUNT,
 			  FAN_FILE_EVENTS, AT_FDCWD, MNT_DIR) ||
 	    fanotify_mark(fanotify_fds[DIR_GROUP], FAN_MARK_ADD | FAN_MARK_MOUNT,
 			  FAN_DIR_EVENTS, AT_FDCWD, MNT_DIR)) {
