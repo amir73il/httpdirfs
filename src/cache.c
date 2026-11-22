@@ -912,8 +912,33 @@ void Cache_close(Cache *cf)
         return;
     }
 
+    /*
+     * Wait for the background download thread, so the metadata that we store
+     * includes the segment it downloads, and it does not access the cache
+     * after it was freed.
+     */
+    lprintf(cache_lock_debug,
+            "thread %x: locking w_lock;\n", pthread_self());
+    PTHREAD_MUTEX_LOCK(&cf->w_lock);
+
+    /*
+     * In fanotify mode, there is no permission event to re-fill a segment
+     * that the metadata marks as downloaded, so after a crash, the metadata
+     * must not mark segments whose data did not make it to disk.
+     * Persist the data before the metadata that marks it downloaded.
+     */
+    if (CONFIG.fanotify_enabled &&
+            (fflush(cf->dfp) || fsync(fileno(cf->dfp)))) {
+        lprintf(error, "cannot sync data file: %s.\n", strerror(errno));
+    }
+
     if (Meta_write(cf)) {
         lprintf(error, "Meta_write() error.");
+    }
+
+    if (CONFIG.fanotify_enabled &&
+            (fflush(cf->mfp) || fsync(fileno(cf->mfp)))) {
+        lprintf(error, "cannot sync metadata: %s.\n", strerror(errno));
     }
 
     if (fclose(cf->mfp)) {
@@ -923,6 +948,10 @@ void Cache_close(Cache *cf)
     if (fclose(cf->dfp)) {
         lprintf(error, "cannot close data file %s.\n", strerror(errno));
     }
+
+    lprintf(cache_lock_debug,
+            "thread %x: unlocking w_lock;\n", pthread_self());
+    PTHREAD_MUTEX_UNLOCK(&cf->w_lock);
 
     cf->link->cache_ptr = NULL;
 
